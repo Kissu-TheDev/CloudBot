@@ -30,10 +30,10 @@ if missing:
 API_ID = int(API_ID)
 ADMIN_ID = int(ADMIN_ID)
 
-app = Client("RoxieCloudbot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+app = Client("KissuCloudbot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
 db_client = AsyncIOMotorClient(MONGODB_URL)
-db = db_client["RoxieDB"]
+db = db_client["KissuDB"]
 settings_col = db["settings"]
 tokens_col = db["tokens"]
 users_col = db["users"]  # broadcast ke liye track karte hain kaun kaun /start kar chuka hai
@@ -307,7 +307,7 @@ async def panel_callback(client, callback_query):
             "**Usage limit ke saath:** `4-8 20-25 VIP 50` (aakhri number = max 50 baar use hoga)\n\n"
             "_Agar limit nahi doge to unlimited use hoga (jab tak expire na ho)._"
         ),
-        "revoke": "❌ Jo token revoke karna hai uska naam bhej (e.g. `Roxie-CuteGirl`):",
+        "revoke": "❌ Jo token revoke karna hai uska naam bhej (e.g. `Kissu-CuteGirl`):",
     }
     pending_action[user_id] = f"awaiting_{action}"
     await callback_query.answer()
@@ -479,7 +479,7 @@ async def handle_admin_pending(client, message):
         expiry_str = config.get("default_timer", "1h")
         seconds = parse_time(expiry_str) or 3600
 
-        token_id = f"Roxie-{name}"
+        token_id = f"Kissu-{name}"
         await tokens_col.update_one(
             {"token_id": token_id},
             {"$set": {
@@ -499,7 +499,7 @@ async def handle_admin_pending(client, message):
         )
 
     elif action == "awaiting_revoke":
-        token_id = text if text.startswith("Roxie-") else f"Roxie-{text}"
+        token_id = text if text.startswith("Kissu-") else f"Kissu-{text}"
         result = await tokens_col.update_one({"token_id": token_id}, {"$set": {"revoked": True}})
         if result.matched_count == 0:
             await message.reply_text(f"❌ Token `{token_id}` mila hi nahi.")
@@ -708,7 +708,7 @@ async def verify_fsub_callback(client, callback_query):
         await callback_query.answer("❌ Abhi bhi join nahi kiya hai. Pehle join kar.", show_alert=True)
 
 
-@app.on_message(filters.private & filters.text & filters.regex(r"^Roxie-") & ~filters.user(ADMIN_ID))
+@app.on_message(filters.private & filters.text & filters.regex(r"^Kissu-") & ~filters.user(ADMIN_ID))
 async def handle_token_input(client, message):
     user_id = message.from_user.id
     token = message.text.strip()
@@ -741,5 +741,5 @@ async def handle_token_input(client, message):
 
 
 if __name__ == "__main__":
-    print("RoxieCloudbot is alive!")
+    print("KissuCloudbot is alive!")
     app.run()
