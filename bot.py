@@ -30,7 +30,7 @@ if missing:
 API_ID = int(API_ID)
 ADMIN_ID = int(ADMIN_ID)
 
-app = Client("KissuCloudbot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+app = Client("KissuCloudBot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
 db_client = AsyncIOMotorClient(MONGODB_URL)
 db = db_client["KissuDB"]
@@ -741,5 +741,5 @@ async def handle_token_input(client, message):
 
 
 if __name__ == "__main__":
-    print("KissuCloudbot is alive!")
+    print("KissuCloudBot is alive!")
     app.run()
