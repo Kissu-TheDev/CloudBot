@@ -1008,9 +1008,9 @@ async def send_batch(client, chat_id, token_data, offset):
                 if auto_delete_seconds > 0:
                     asyncio.create_task(schedule_delete(client, chat_id, sent.id, auto_delete_seconds))
             except Exception as e:
-                await client.send_message(chat_id, f"⚠️ File ID {msg_id} bhejne me error (retry ke baad bhi): {e}")
+                await client.send_message(chat_id, f"🚫")
         except Exception as e:
-            await client.send_message(chat_id, f"⚠️ File ID {msg_id} bhejne me error: {e}")
+            await client.send_message(chat_id, f"🚫")
 
     next_offset = offset + PAGE_SIZE
     total_files = len(all_files)
@@ -1022,7 +1022,7 @@ async def send_batch(client, chat_id, token_data, offset):
 
     if auto_delete_seconds > 0:
         unit_label = f"{auto_delete_seconds // 60}m" if auto_delete_seconds >= 60 else f"{auto_delete_seconds}s"
-        await client.send_message(chat_id, f"⚠️ Ye files {unit_label} me delete ho jayengi, jaldi save kar lo.")
+        await client.send_message(chat_id, f"⚠️ Ye files {unit_label} me delete ho jayengi.")
 
 
 @app.on_callback_query(filters.regex(r"^next_"))
