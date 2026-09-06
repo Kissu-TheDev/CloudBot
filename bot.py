@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from pyrogram import Client, filters, StopPropagation
+from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant, FloodWait
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -46,53 +46,19 @@ users_col = db["users"]  # broadcast ke liye track karte hain kaun kaun /start k
 
 PAGE_SIZE = 10
 pending_action = {}  # { user_id: "awaiting_xxx" }
-pending_language = {}  # { user_id: {"token": "Kissu-xyz" | None} } - language pick hone tak deep-link token yahan hold hota hai
-cooldown_tracker = {}  # { user_id: {"attempts": int, "cooldown_until": datetime | None} } - token-submission cooldown, in-memory (bot restart pe reset ho jaata hai, acceptable)
 BOT_USERNAME = None  # startup pe app.get_me() se fill hoga, deep-link banane ke liye
 
 # ==========================================
 # 💬 DEFAULT CUSTOMIZABLE MESSAGES
-# Ye saare keys admin panel se edit ho sakte hain, aur ab HAR key language ke
-# hisaab se nested hai: DEFAULT_MESSAGES[key][lang] = {"text": ..., "extra": [...]}.
+# Ye saare keys admin panel se edit ho sakte hain.
 # "extra" ek list hai - trigger pe in sabhi messages ko bhi bhejega (order me).
 # ==========================================
 DEFAULT_MESSAGES = {
-    "welcome": {
-        "hi": {
-            "text": (
-                "Namaste! 🎉 KissuCloudBot me aapka swagat hai.\n"
-                "Yahan aap apne token ke zariye files prapt kar sakte hain.\n"
-                "Bas apna token bhejein ya /start ke saath token daalein.\n"
-                "Agar koi dikkat ho, to admin se contact karein."
-            ),
-            "extra": [],
-        },
-        "en": {
-            "text": (
-                "Welcome to KissuCloudBot.\n"
-                "This platform enables you to retrieve files using your unique token.\n"
-                "To begin, please submit your token via the /start command followed by the token string.\n"
-                "Should you encounter any issues, kindly contact the administrator."
-            ),
-            "extra": [],
-        },
-    },
-    "verified": {
-        "hi": {"text": "✅ Token sahi hai! Ab aapki files bheji ja rahi hain...", "extra": []},
-        "en": {"text": "✅ Token verified. Your files are now being delivered.", "extra": []},
-    },
-    "sending": {
-        "hi": {"text": "📤 Aapki files bheji ja rahi hain... thoda intezar karein.", "extra": []},
-        "en": {"text": "📤 Your files are being transmitted. Please wait a moment.", "extra": []},
-    },
-    "invalid_token": {
-        "hi": {"text": "❌ Ye token galat hai ya expired ho chuka hai. Sahi token daalein.", "extra": []},
-        "en": {"text": "❌ The token you provided is either invalid or has expired. Please verify and try again.", "extra": []},
-    },
-    "not_joined": {
-        "hi": {"text": "⚠️ Is channel ko join karna zaroori hai! Pehle channel join karein, phir wapas try karein.", "extra": []},
-        "en": {"text": "⚠️ Access requires membership in the designated channel. Please join the channel and then retry.", "extra": []},
-    },
+    "welcome": {"text": "🧑‍💻", "extra": []},
+    "verified": {"text": "🪪", "extra": []},
+    "sending": {"text": "📤", "extra": []},
+    "invalid_token": {"text": "❌", "extra": []},
+    "not_joined": {"text": "❌ Pehle channel join karo.", "extra": []},
 }
 
 
@@ -141,120 +107,23 @@ async def is_fsub_joined(client, user_id):
         return False
 
 
-async def get_message(key, lang="hi"):
-    """Custom message uthata hai DB se (language ke hisaab se), warna default use karta hai.
-    Agar requested lang custom me nahi mila to us key ke DEFAULT_MESSAGES se nikaalte hain,
-    aur wo bhi na mile to 'hi' pe fallback karte hain."""
+async def get_message(key):
+    """Custom message uthata hai DB se, warna default use karta hai."""
     config = await get_config()
-    custom_key = config.get("messages", {}).get(key, {})
-    if isinstance(custom_key, dict) and lang in custom_key:
-        return custom_key[lang]
-    defaults_for_key = DEFAULT_MESSAGES.get(key, {})
-    return defaults_for_key.get(lang) or defaults_for_key.get("hi") or {"text": "", "extra": []}
+    custom = config.get("messages", {}).get(key)
+    if custom:
+        return custom
+    return DEFAULT_MESSAGES.get(key, {"text": "", "extra": []})
 
 
-async def send_custom(client, chat_id, key, lang="hi", reply_markup=None):
-    """Custom message + extras bhejta hai (language-aware). Main text ka Message object
-    return karta hai (edit/delete-tracking ke liye)."""
-    msg_data = await get_message(key, lang)
+async def send_custom(client, chat_id, key, reply_markup=None):
+    """Custom message + extras bhejta hai. Main text ka Message object return karta hai (edit ke liye)."""
+    msg_data = await get_message(key)
     main = await client.send_message(chat_id, msg_data["text"], reply_markup=reply_markup)
     for extra_text in msg_data.get("extra", []):
         await client.send_message(chat_id, extra_text)
         await asyncio.sleep(0.3)
     return main
-
-
-# ==========================================
-# 🌐 LANGUAGE SELECTION — helpers
-# ==========================================
-
-async def get_user_language(user_id):
-    """DB se language uthata hai. Default 'hi' agar set nahi hai."""
-    user = await users_col.find_one({"_id": user_id})
-    return (user or {}).get("language", "hi")
-
-
-async def set_user_language(user_id, lang):
-    await users_col.update_one({"_id": user_id}, {"$set": {"language": lang}}, upsert=True)
-
-
-def language_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇮🇳 Hinglish", callback_data="lang_hi"),
-         InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
-    ])
-
-
-async def show_language_picker(client, chat_id):
-    """Language picker — ye text fixed hai, admin isse edit nahi kar sakta (DEFAULT_MESSAGES ka hissa nahi)."""
-    await client.send_message(
-        chat_id,
-        "🌐 Choose your language / apni bhasha chunein:\n"
-        "🇮🇳 Hinglish – casual, friendly\n"
-        "🇬🇧 English – formal, professional",
-        reply_markup=language_markup()
-    )
-
-
-async def send_welcome_or_verified(client, chat_id, user_id, lang):
-    """FSUB-gated welcome/verified logic — /start (bina token ke) aur language-selection
-    ke baad (agar deep-link token nahi tha) dono jagah se same cheez chahiye, isliye
-    ek helper me nikal diya taaki dono jagah sync rahe."""
-    config = await get_config()
-    fsub_link = config.get("fsub_link")
-    if fsub_link and not await is_fsub_joined(client, user_id):
-        buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
-            [InlineKeyboardButton("✅ Verify", callback_data="verify_fsub")],
-        ])
-        return await send_custom(client, chat_id, "welcome", lang=lang, reply_markup=buttons)
-    await send_custom(client, chat_id, "verified", lang=lang)
-
-
-# ==========================================
-# ⏱ TOKEN REDEMPTION COOLDOWN — helpers
-# ==========================================
-
-def is_cooldown_active(user_id):
-    """Return (bool, remaining_seconds). Purely in-memory check — bot restart pe
-    cooldown state reset ho jaata hai (acceptable, DB me persist karne ki zaroorat nahi)."""
-    state = cooldown_tracker.get(user_id)
-    if not state or not state.get("cooldown_until"):
-        return False, 0
-    remaining = (state["cooldown_until"] - datetime.now()).total_seconds()
-    if remaining <= 0:
-        # Cooldown khatam ho chuka - reset karo taaki agli baar fresh cycle chale
-        cooldown_tracker[user_id] = {"attempts": 0, "cooldown_until": None}
-        return False, 0
-    return True, int(remaining) + 1  # round up taaki "0 sec baad" jaisa awkward message na dikhe
-
-
-async def record_token_attempt(user_id):
-    """Har token submission (valid ya invalid) is_cooldown_active check ke baad ye call karta hai.
-    3 consecutive attempts pe cooldown lagta hai, phir attempts reset ho jaate hain."""
-    state = cooldown_tracker.setdefault(user_id, {"attempts": 0, "cooldown_until": None})
-    state["attempts"] += 1
-    if state["attempts"] >= 3:
-        duration = await get_cooldown_duration()
-        state["cooldown_until"] = datetime.now() + timedelta(seconds=duration)
-        state["attempts"] = 0
-
-
-async def get_cooldown_duration():
-    """Settings se cooldown duration (seconds) uthata hai, default 30."""
-    config = await get_config()
-    return config.get("cooldown_duration", 30)
-
-
-async def set_cooldown_duration(seconds):
-    await settings_col.update_one({"_id": "config"}, {"$set": {"cooldown_duration": seconds}}, upsert=True)
-
-
-def cooldown_message(lang, remaining_seconds):
-    """Cooldown active hone par dikhaya jaane wala message — fixed hai, admin-editable nahi."""
-    if lang == "en":
-        return f"⏳ Please wait before submitting another token. You may try again in {remaining_seconds} seconds."
-    return f"⏳ thoda ruko bhai! {remaining_seconds} sec baad try karo."
 
 
 # ==========================================
@@ -294,7 +163,6 @@ async def admin_panel_markup():
          InlineKeyboardButton("🗄 Set DB Channel", callback_data="panel_setdb")],
         [InlineKeyboardButton("⏱ Set Timer", callback_data="panel_settimer"),
          InlineKeyboardButton("🗑 Auto-Delete", callback_data="panel_autodelete")],
-        [InlineKeyboardButton("⏱️ Cooldown Duration", callback_data="panel_cooldown")],
         [InlineKeyboardButton("🔑 Generate Token", callback_data="panel_gentoken"),
          InlineKeyboardButton("❌ Revoke Token", callback_data="panel_revoke")],
         [InlineKeyboardButton("🔍 Search/List Tokens", callback_data="panel_search")],
@@ -340,16 +208,6 @@ def autodelete_markup():
          InlineKeyboardButton("6h", callback_data="adel_6h")],
         [InlineKeyboardButton("🔴 Off", callback_data="adel_off"),
          InlineKeyboardButton("✏️ Custom", callback_data="adel_custom")],
-        [InlineKeyboardButton("🔙 Back", callback_data="panel_back")],
-    ])
-
-
-def cooldown_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("30s", callback_data="cldn_30"),
-         InlineKeyboardButton("1m", callback_data="cldn_60"),
-         InlineKeyboardButton("5m", callback_data="cldn_300")],
-        [InlineKeyboardButton("✏️ Custom", callback_data="cldn_custom")],
         [InlineKeyboardButton("🔙 Back", callback_data="panel_back")],
     ])
 
@@ -533,7 +391,6 @@ async def panel_callback(client, callback_query):
             f"🔒 Content Protection: {'ON' if config.get('content_protection') else 'OFF'}\n"
             f"🗑 Auto-Delete: {config.get('auto_delete_seconds', 0)}s\n"
             f"⏱ Default Timer: `{config.get('default_timer', '1h')}`\n"
-            f"⏱️ Cooldown Duration: {config.get('cooldown_duration', 30)}s\n"
         )
         await callback_query.answer()
         return await callback_query.message.reply_text(debug_text)
@@ -592,12 +449,6 @@ async def panel_callback(client, callback_query):
         await callback_query.answer()
         return await callback_query.message.edit_text(
             "🗑 Files kitni der baad auto-delete ho, chuno:", reply_markup=autodelete_markup()
-        )
-
-    if action == "cooldown":
-        await callback_query.answer()
-        return await callback_query.message.edit_text(
-            "⏱️ Token submission ke beech cooldown duration chuno:", reply_markup=cooldown_markup()
         )
 
     if action == "gentoken":
@@ -667,27 +518,6 @@ async def autodelete_callback(client, callback_query):
         await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": seconds}}, upsert=True)
         await callback_query.answer(f"✅ Auto-delete set: {value}")
 
-    await callback_query.message.edit_text(
-        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
-    )
-
-
-@app.on_callback_query(filters.regex(r"^cldn_") & filters.user(ADMIN_ID))
-async def cooldown_callback(client, callback_query):
-    value = callback_query.data.split("_", 1)[1]
-    user_id = callback_query.from_user.id
-
-    if value == "custom":
-        pending_action[user_id] = "awaiting_cooldown"
-        back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
-        await callback_query.answer()
-        return await callback_query.message.edit_text(
-            "⏱️ Cooldown duration seconds me bhej (min 5):", reply_markup=back_btn
-        )
-
-    seconds = int(value)
-    await set_cooldown_duration(seconds)
-    await callback_query.answer(f"✅ Cooldown set: {seconds}s")
     await callback_query.message.edit_text(
         "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
     )
@@ -836,45 +666,20 @@ async def gentoken_wizard_callback(client, callback_query):
         return await callback_query.message.edit_text(reply_text)
 
 
-@app.on_callback_query(filters.regex(r"^editmsg_(?!lang_)") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^editmsg_") & filters.user(ADMIN_ID))
 async def editmsg_callback(client, callback_query):
-    """Step 2/3: key select ho gaya -> ab language chuno (Hinglish ya English)."""
     key = callback_query.data.split("_", 1)[1]
-    await callback_query.answer()
-
-    if key not in DEFAULT_MESSAGES:
-        return await callback_query.message.edit_text("❌ Message key not found.", reply_markup=edit_msg_markup())
-
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇮🇳 Hinglish", callback_data=f"editmsg_lang_{key}_hi"),
-         InlineKeyboardButton("🇬🇧 English", callback_data=f"editmsg_lang_{key}_en")],
-        [InlineKeyboardButton("🔙 Back", callback_data="panel_editmsg")],
-    ])
-    await callback_query.message.edit_text(
-        f"✏️ **{key}** — kaunsi language version edit karni hai?", reply_markup=buttons
-    )
-
-
-@app.on_callback_query(filters.regex(r"^editmsg_lang_") & filters.user(ADMIN_ID))
-async def editmsg_lang_callback(client, callback_query):
-    """Step 3/3: language chuni -> current text dikhao + naya text maango."""
-    parts = callback_query.data.split("_")
-    lang = parts[-1]
-    key = "_".join(parts[2:-1])  # key me khud underscore ho sakta hai (e.g. invalid_token)
     user_id = callback_query.from_user.id
-
-    pending_action[user_id] = {"flow": "editmsg", "key": key, "lang": lang, "step": "awaiting_text"}
-    current = await get_message(key, lang)
-    lang_label = "Hinglish" if lang == "hi" else "English"
-    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"editmsg_{key}")]])
+    pending_action[user_id] = f"awaiting_editmsg_{key}"
+    current = await get_message(key)
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_editmsg")]])
     await callback_query.answer()
-    await callback_query.message.edit_text(
-        f"✏️ Current **{lang_label}** text for `{key}`:\n\n"
-        f"`{current['text']}`\n"
+    await callback_query.message.reply_text(
+        f"✏️ **{key}** ka naya text bhej.\n\n"
+        f"Current: `{current['text']}`\n"
         f"Extra messages: {len(current.get('extra', []))}\n\n"
-        f"Naya text reply karke bhej. Extra message add karni ho to `|||` se separate kar:\n"
-        f"`MainText|||ExtraMsg1|||ExtraMsg2`\n\n"
-        f"/cancel se abort kar sakte ho.",
+        f"Agar extra message bhi add karni hai to naya text ke baad `|||` daal ke likh:\n"
+        f"`MainText|||ExtraMsg1|||ExtraMsg2`",
         reply_markup=back_btn
     )
 
@@ -954,27 +759,6 @@ async def search_tokens_command(client, message):
 # 📩 ADMIN'S FOLLOW-UP REPLIES
 # ==========================================
 
-async def handle_editmsg_wizard_text(client, message, user_id, action):
-    """Edit Messages wizard ka typed step: naya text (aur optional extras) us key+lang
-    ke liye DB me save karta hai."""
-    key = action["key"]
-    lang = action["lang"]
-    text = message.text.strip()
-    bits = text.split("|||")
-    main_text = bits[0].strip()
-    extras = [b.strip() for b in bits[1:] if b.strip()]
-
-    config = await get_config()
-    messages = config.get("messages", {})
-    messages.setdefault(key, {})
-    messages[key][lang] = {"text": main_text, "extra": extras}
-    await settings_col.update_one({"_id": "config"}, {"$set": {"messages": messages}}, upsert=True)
-
-    pending_action.pop(user_id, None)
-    lang_label = "Hinglish" if lang == "hi" else "English"
-    await message.reply_text(f"✅ `{key}` ({lang_label}) update ho gaya.\nMain: {main_text}\nExtras: {len(extras)}")
-
-
 async def handle_gentoken_wizard_text(client, message, user_id, action):
     """Generate Token wizard ke 4 typed steps: files, naam, limit-value, expiry-value.
     Baaki sab steps (limit/expiry choice, auto-delete, link, confirm) buttons se
@@ -1031,15 +815,8 @@ async def handle_gentoken_wizard_text(client, message, user_id, action):
         )
 
 
-@app.on_message(filters.command("cancel") & filters.user(ADMIN_ID))
-async def cancel_command(client, message):
-    """Kisi bhi pending admin flow (editmsg, gentoken, etc.) ko cancel karta hai."""
-    pending_action.pop(message.from_user.id, None)
-    await message.reply_text("❌ Cancel kar diya.")
-
-
 @app.on_message(filters.private & filters.text & filters.user(ADMIN_ID) & ~filters.command([
-    "start", "admin", "addchannel", "search", "cancel"
+    "start", "admin", "addchannel", "search"
 ]))
 async def handle_admin_pending(client, message):
     user_id = message.from_user.id
@@ -1049,9 +826,6 @@ async def handle_admin_pending(client, message):
 
     if isinstance(action, dict) and action.get("flow") == "gentoken":
         return await handle_gentoken_wizard_text(client, message, user_id, action)
-
-    if isinstance(action, dict) and action.get("flow") == "editmsg":
-        return await handle_editmsg_wizard_text(client, message, user_id, action)
 
     text = message.text.strip()
 
@@ -1091,11 +865,16 @@ async def handle_admin_pending(client, message):
             await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": seconds}}, upsert=True)
             await message.reply_text(f"✅ Files ab {text} baad auto-delete hongi.")
 
-    elif action == "awaiting_cooldown":
-        if not text.isdigit() or int(text) < 5:
-            return await message.reply_text("❌ Minimum 5 seconds hona chahiye — dobara bhej.")
-        await set_cooldown_duration(int(text))
-        await message.reply_text(f"✅ Cooldown duration set ho gaya: {text}s")
+    elif action.startswith("awaiting_editmsg_"):
+        key = action.replace("awaiting_editmsg_", "")
+        bits = text.split("|||")
+        main_text = bits[0].strip()
+        extras = [b.strip() for b in bits[1:] if b.strip()]
+        config = await get_config()
+        messages = config.get("messages", {})
+        messages[key] = {"text": main_text, "extra": extras}
+        await settings_col.update_one({"_id": "config"}, {"$set": {"messages": messages}}, upsert=True)
+        await message.reply_text(f"✅ `{key}` update ho gaya.\nMain: {main_text}\nExtras: {len(extras)}")
 
     elif action == "awaiting_import":
         try:
@@ -1177,8 +956,6 @@ async def handle_admin_pending(client, message):
 # ==========================================
 
 async def schedule_delete(client, chat_id, message_id, delay_seconds):
-    if delay_seconds <= 0:
-        return
     await asyncio.sleep(delay_seconds)
     try:
         await client.delete_messages(chat_id, message_id)
@@ -1186,9 +963,7 @@ async def schedule_delete(client, chat_id, message_id, delay_seconds):
         pass
 
 
-async def send_batch(client, chat_id, token_data, offset, extra_message_ids=None):
-    """extra_message_ids: pehle se bheje gaye messages (e.g. 'sending' status) jinhe is
-    batch ke auto-delete cycle me shaamil karna hai — same delay follow karenge."""
+async def send_batch(client, chat_id, token_data, offset):
     db_channel_id = await get_db_channel_id()
     if not db_channel_id:
         return await client.send_message(chat_id, "❌ DB Channel set nahi hai. Admin ko batao.")
@@ -1213,18 +988,14 @@ async def send_batch(client, chat_id, token_data, offset, extra_message_ids=None
     if not batch:
         return await client.send_message(chat_id, "❌ Aur files nahi hain.")
 
-    # Is batch ke sabhi messages (pichhla 'sending' status + files + progress + warning)
-    # yahan track hote hain, taaki auto-delete FILES ke saath STATUS messages ko bhi
-    # saaf kare — pehle sirf files delete hoti thi, status messages reh jaate the.
-    sent_message_ids = list(extra_message_ids or [])
-
     for msg_id in batch:
         try:
             sent = await client.copy_message(
                 chat_id=chat_id, from_chat_id=db_channel_id, message_id=msg_id,
                 protect_content=protect
             )
-            sent_message_ids.append(sent.id)
+            if auto_delete_seconds > 0:
+                asyncio.create_task(schedule_delete(client, chat_id, sent.id, auto_delete_seconds))
             await asyncio.sleep(0.7)
         except FloodWait as fw:
             # Telegram ne rate-limit lagaya - jitna bola utna wait karke retry karo
@@ -1234,13 +1005,12 @@ async def send_batch(client, chat_id, token_data, offset, extra_message_ids=None
                     chat_id=chat_id, from_chat_id=db_channel_id, message_id=msg_id,
                     protect_content=protect
                 )
-                sent_message_ids.append(sent.id)
+                if auto_delete_seconds > 0:
+                    asyncio.create_task(schedule_delete(client, chat_id, sent.id, auto_delete_seconds))
             except Exception as e:
-                warn = await client.send_message(chat_id, f"⚠️ File ID {msg_id} bhejne me error (retry ke baad bhi): {e}")
-                sent_message_ids.append(warn.id)
+                await client.send_message(chat_id, f"⚠️ File ID {msg_id} bhejne me error (retry ke baad bhi): {e}")
         except Exception as e:
-            warn = await client.send_message(chat_id, f"⚠️ File ID {msg_id} bhejne me error: {e}")
-            sent_message_ids.append(warn.id)
+            await client.send_message(chat_id, f"⚠️ File ID {msg_id} bhejne me error: {e}")
 
     next_offset = offset + PAGE_SIZE
     total_files = len(all_files)
@@ -1248,17 +1018,11 @@ async def send_batch(client, chat_id, token_data, offset, extra_message_ids=None
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton(
             "Next ⏭", callback_data=f"next_{token_data['token_id']}_{next_offset}"
         )]])
-        progress_msg = await client.send_message(chat_id, f"({min(next_offset, total_files)}/{total_files} files sent)", reply_markup=buttons)
-        sent_message_ids.append(progress_msg.id)
+        await client.send_message(chat_id, f"({min(next_offset, total_files)}/{total_files} files sent)", reply_markup=buttons)
 
     if auto_delete_seconds > 0:
         unit_label = f"{auto_delete_seconds // 60}m" if auto_delete_seconds >= 60 else f"{auto_delete_seconds}s"
-        warn_msg = await client.send_message(chat_id, f"⚠️ Ye files {unit_label} me delete ho jayengi, jaldi save kar lo.")
-        sent_message_ids.append(warn_msg.id)
-
-        # Files + status messages (sending/progress/warning) — sabko SAME delay ke saath schedule karo
-        for mid in sent_message_ids:
-            asyncio.create_task(schedule_delete(client, chat_id, mid, auto_delete_seconds))
+        await client.send_message(chat_id, f"⚠️ Ye files {unit_label} me delete ho jayengi, jaldi save kar lo.")
 
 
 @app.on_callback_query(filters.regex(r"^next_"))
@@ -1281,16 +1045,9 @@ async def next_batch_callback(client, callback_query):
 # 🚀 USER FLOW (non-admin): /start -> welcome + Join/Verify -> verified -> token -> sending
 # ==========================================
 
-async def redeem_token(client, user_id, chat_id, token, lang="hi"):
-    """Token check + file delivery — plain-text token, deep-link (/start token), aur
-    language-picker ke baad delayed redemption sabhi yahan se guzarte hain.
-    Cooldown gate sabse pehle check hota hai (ye token-submission attempt bhi record karta
-    hai), uske baad FSUB aur token validity."""
-    active, remaining = is_cooldown_active(user_id)
-    if active:
-        return await client.send_message(chat_id, cooldown_message(lang, remaining))
-
-    await record_token_attempt(user_id)
+async def redeem_token(client, message, token):
+    """Token check + file delivery — plain-text token aur deep-link (/start token) dono se call hota hai."""
+    user_id = message.from_user.id
 
     if not await is_fsub_joined(client, user_id):
         config = await get_config()
@@ -1301,91 +1058,57 @@ async def redeem_token(client, user_id, chat_id, token, lang="hi"):
                 [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
                 [InlineKeyboardButton("✅ Verify", callback_data="verify_fsub")],
             ])
-        return await send_custom(client, chat_id, "not_joined", lang=lang, reply_markup=buttons)
+        return await send_custom(client, message.chat.id, "not_joined", reply_markup=buttons)
 
     token_data = await tokens_col.find_one({"token_id": token})
 
     if not token_data or token_data.get("revoked") or datetime.now() > token_data["expiry_time"]:
-        return await send_custom(client, chat_id, "invalid_token", lang=lang)
+        return await send_custom(client, message.chat.id, "invalid_token")
 
     usage_limit = token_data.get("usage_limit")
     used_count = token_data.get("used_count", 0)
     if usage_limit is not None and used_count >= usage_limit:
-        return await client.send_message(chat_id, "❌ Ye token apni usage limit tak pahuch chuka hai.")
+        return await message.reply_text("❌ Ye token apni usage limit tak pahuch chuka hai.")
 
     await tokens_col.update_one({"token_id": token}, {"$inc": {"used_count": 1}})
 
-    sending_msg = await send_custom(client, chat_id, "sending", lang=lang)
-    await send_batch(client, chat_id, token_data, offset=0, extra_message_ids=[sending_msg.id])
-
-
-@app.on_message(filters.private & ~filters.user(ADMIN_ID), group=-1)
-async def pending_language_guard(client, message):
-    """Agar user language-picker pending hai aur usne button dabane ke bajaye
-    kuch aur (command/text) bhej diya, to wahi ignore karke picker dobara dikhao —
-    normal handlers tak baat propagate nahi hone dete."""
-    user_id = message.from_user.id
-    if user_id in pending_language:
-        await show_language_picker(client, message.chat.id)
-        raise StopPropagation
+    await send_custom(client, message.chat.id, "sending")
+    await send_batch(client, message.chat.id, token_data, offset=0)
 
 
 @app.on_message(filters.command("start") & filters.private & ~filters.user(ADMIN_ID))
 async def user_start(client, message):
-    user_id = message.from_user.id
-    existing_user = await users_col.find_one({"_id": user_id})
     await users_col.update_one(
-        {"_id": user_id},
-        {"$set": {"_id": user_id, "first_seen": datetime.now()}},
+        {"_id": message.from_user.id},
+        {"$set": {"_id": message.from_user.id, "first_seen": datetime.now()}},
         upsert=True
     )
-
-    # Naya user ya purana user jiske paas abhi "language" field nahi hai — dono ke liye
-    # pehle language chunwao. Deep-link token (agar hai) language-choice tak pending_language me hold hota hai.
-    if not existing_user or "language" not in existing_user:
-        token = message.command[1].strip() if len(message.command) > 1 else None
-        pending_language[user_id] = {"token": token}
-        return await show_language_picker(client, message.chat.id)
-
-    lang = existing_user.get("language", "hi")
 
     # Deep-link se aaya hai to /start ke saath token bhi hoga: /start Kissu-Cutie
     if len(message.command) > 1:
         token = message.command[1].strip()
         if token.startswith("Kissu-"):
-            return await redeem_token(client, user_id, message.chat.id, token, lang)
+            return await redeem_token(client, message, token)
 
-    await send_welcome_or_verified(client, message.chat.id, user_id, lang)
+    config = await get_config()
+    fsub_link = config.get("fsub_link")
 
+    if fsub_link and not await is_fsub_joined(client, message.from_user.id):
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
+            [InlineKeyboardButton("✅ Verify", callback_data="verify_fsub")],
+        ])
+        return await send_custom(client, message.chat.id, "welcome", reply_markup=buttons)
 
-@app.on_callback_query(filters.regex(r"^lang_(hi|en)$"))
-async def language_callback(client, callback_query):
-    """Language picker ka button tap — language save karta hai, phir pending token
-    (agar deep-link se aaya tha) redeem karta hai ya normal welcome/verified dikhata hai."""
-    user_id = callback_query.from_user.id
-    lang = "hi" if callback_query.data == "lang_hi" else "en"
-    chat_id = callback_query.message.chat.id
-
-    await set_user_language(user_id, lang)
-    pending = pending_language.pop(user_id, {})
-    token = pending.get("token")
-
-    await callback_query.answer("Language set! ✅")
-    await callback_query.message.delete()
-
-    if token and token.startswith("Kissu-"):
-        await redeem_token(client, user_id, chat_id, token, lang)
-    else:
-        await send_welcome_or_verified(client, chat_id, user_id, lang)
+    await send_custom(client, message.chat.id, "verified")
 
 
 @app.on_callback_query(filters.regex(r"^verify_fsub$"))
 async def verify_fsub_callback(client, callback_query):
     user_id = callback_query.from_user.id
     if await is_fsub_joined(client, user_id):
-        lang = await get_user_language(user_id)
         await callback_query.answer("✅ Verified!")
-        msg_data = await get_message("verified", lang)
+        msg_data = await get_message("verified")
         await callback_query.message.edit_text(msg_data["text"])
         for extra_text in msg_data.get("extra", []):
             await client.send_message(callback_query.message.chat.id, extra_text)
@@ -1395,9 +1118,8 @@ async def verify_fsub_callback(client, callback_query):
 
 @app.on_message(filters.private & filters.text & filters.regex(r"^Kissu-") & ~filters.user(ADMIN_ID))
 async def handle_token_input(client, message):
-    lang = await get_user_language(message.from_user.id)
     token = message.text.strip()
-    await redeem_token(client, message.from_user.id, message.chat.id, token, lang)
+    await redeem_token(client, message, token)
 
 
 async def get_bot_username():
