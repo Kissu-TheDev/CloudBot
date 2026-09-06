@@ -1175,7 +1175,7 @@ async def redeem_token(client, message, token):
     usage_limit = token_data.get("usage_limit")
     used_count = token_data.get("used_count", 0)
     if usage_limit is not None and used_count >= usage_limit:
-        return await message.reply_text("❌ Ye token apni usage limit tak pahuch chuka hai.")
+        return await message.reply_text("❌")
 
     record_redemption(user_id)
     await tokens_col.update_one({"token_id": token}, {"$inc": {"used_count": 1}})
