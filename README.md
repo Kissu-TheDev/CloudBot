@@ -1,79 +1,88 @@
-# CloudBot
+# 🧑‍💻 CloudBot
 
-A Telegram bot for **token-based file delivery**. Files are stored in a private Telegram channel (the "DB Channel"); the bot copies them to a user's chat only when the user presents a valid token.
+Ek Telegram bot jo **token-based file delivery** karta hai — ek private DB channel se files ko token ke through users tak bhejta hai, saath mein force-subscribe, auto-delete, per-token expiry, rate-limiting, aur ek fully button-based admin panel ke saath.
 
-> KissuCloudBot is not a file-storage service. No file is ever uploaded to or held by the bot itself — files reside in an existing Telegram channel, and the bot's role is limited to verifying a token and copying the associated messages to the requesting user.
+> 📦 Ye actual "cloud storage" nahi hai. Files kahin upload nahi hoti bot ke through — wo pehle se ek Telegram channel (DB Channel) mein padi hoti hain, bot sirf token ke basis pe unhe copy karke bhejta hai.
 
 ---
 
-## 🇮🇳 Hinglish
+## Bot Kya Karta Hai
 
-### Bot Kya Karta Hai
-
-1. Admin apne ek private Telegram channel mein files rakhta hai ("DB Channel").
-2. Admin, admin panel ke through un files ke liye ek token generate karta hai (format: `Kissu-<naam>`).
-3. Token, user ko manually share kiya jaata hai — bot khud koi shareable link nahi banata (jab tak deep-link explicitly na maanga jaaye).
+1. Admin apne ek private Telegram channel mein files daalta hai ("DB Channel").
+2. Admin, admin panel se un files ke liye token generate karta hai (format: `Kissu-<naam>`).
+3. Token user ko manually diya jaata hai — ya agar deep-link maanga ho, to seedha ek clickable link mil jaata hai jo Telegram khol ke token auto-submit kar deta hai.
 4. User `/start` karta hai. Agar force-subscribe (FSUB) channel set hai, to pehle join karna zaroori hota hai.
-5. User token bhejta hai → bot DB channel se corresponding files copy karke deliver karta hai.
-6. Agar auto-delete on hai, to delivered files ek set time ke baad user ke chat se apne aap hat jaati hain.
+5. User token bhejta hai → bot DB channel se files copy karke deliver kar deta hai.
+6. Agar auto-delete on hai, to files ek set time baad khud delete ho jaati hain.
 
-### Features
+## Features
 
 - **Token System** — single file, range (`4-8`), ya multiple ranges (`4-8 20-25`) ek hi token mein.
-- **Usage Limit** — token ko fix number of redemptions tak limit kiya ja sakta hai.
-- **Force Subscribe (FSUB)** — file delivery ek channel join karne se conditional hoti hai. Membership-check fail-closed hai: agar check ke dauraan koi error aaye (jaise bot ka us channel mein admin access na hona), to user ko *not-joined* treat kiya jaata hai, bypass allow nahi hota.
-- **Auto-Delete** — delivered files ek configurable delay ke baad khud delete ho jaati hain.
-- **Content Protection** — Telegram ke `protect_content` flag se forward/save optionally block kiya ja sakta hai.
-- **Custom Messages** — welcome, verified, sending, invalid-token, aur not-joined states admin panel se editable hain, extra follow-up messages ke saath.
-- **Broadcast** — sabhi users ko, ya specific channels ko message bhejne ki facility.
-- **Export/Import Settings** — poora config JSON ke roop mein backup/restore ho sakta hai.
-- **Debug Panel** — total users, active tokens, aur DB/FSUB status ek jagah dikhta hai.
+- **Usage Limit** — token ko fix number of redemptions tak limit kiya ja sakta hai, ya unlimited chhoda ja sakta hai.
+- **Per-Token Expiry** — har token ki apni custom expiry ho sakti hai (global default se alag).
+- **Auto-Delete Override** — har token ke liye alag se decide ho sakta hai ki uski files auto-delete hongi ya nahi (global setting se independent).
+- **Deep-Link Generation** — chaho to token ke saath ek `t.me/BotUsername?start=token` wala link bhi mil jaata hai, jisse user seedha click karke redeem kar sake.
+- **Force Subscribe (FSUB)** — file delivery channel-join se conditional hai. Membership check **fail-closed** hai: agar check ke dauraan koi error aaye (jaise bot ka us channel mein admin access na hona), to user ko *not-joined* treat kiya jaata hai — koi accidental bypass nahi hota. Trade-off: agar bot kabhi FSUB channel ka admin nahi raha, sab users block ho jaayenge — isliye `/admin` → Debug se status check karte rehna zaroori hai.
+- **Rate-Limiting** 🤖 — agar koi user ek chhoti time-window ke andar bahut baar token redeem kare, to usko thodi der ke liye rok diya jaata hai (`🤖` + cooldown message). Count, window, cooldown-time, aur message — sab `/admin` se customize ho sakte hain.
+- **Content Protection** — Telegram ke `protect_content` flag se forward/save optionally block ho sakta hai.
+- **Customizable Messages** — welcome, verified, not-joined, restricted, admin-welcome, sending, invalid-token — sab default mein sirf ek emoji hain, lekin admin panel se chaho to inme extra text/messages add kiye ja sakte hain.
+- **Broadcast** — sabhi users ko, ya specific channels ko ek saath message bhejne ki facility.
+- **Export/Import Settings** — poora config JSON mein backup/restore ho sakta hai.
+- **Debug Panel** — total users, active tokens, DB/FSUB status ek jagah.
 - **Pagination** — bade token batches mein (10-10 files) deliver hote hain, "Next" button ke saath.
-- **FloodWait Handling** — Telegram ke rate-limit lagne par bot khud wait karke retry karta hai.
+- **FloodWait Handling** — Telegram ka rate-limit lagne pe bot khud wait karke retry karta hai.
 
-### Admin Panel — Button-Based Workflow
+## Admin Panel — Poora Button-Based
 
-Admin panel ka poora interaction ab primarily inline buttons se hota hai; typing sirf un jagah zaroori hai jahan koi free-form value (file ID, token ka naam, ek custom number ya time) di jaani ho.
+Admin panel ka poora interaction ab inline buttons se hota hai — typing sirf wahin zaroori hai jahan koi genuinely free-form value chahiye (file ID, token ka naam, ek custom number/time). Kisi bhi settings-change ke baad naya message aane ki jagah, wahi purana panel-message edit ho jaata hai — taaki chat mein bar-bar naye bubbles na aayein.
 
-**Set Timer** (`/admin` → ⏱ Set Timer)
-- Preset buttons: `30m`, `1h`, `6h`, `1d` — tap karte hi seedha default expiry set ho jaati hai.
-- `✏️ Custom` — agar in presets se alag koi value chahiye, ye button ek text-prompt kholta hai (format: `1h`, `30m`, `1d`).
+**Set Timer** (⏱ Set Timer)
+- Preset buttons: `30m`, `1h`, `6h`, `1d`.
+- `✏️ Custom` — koi aur value chahiye to text-prompt khulta hai.
 
-**Auto-Delete** (`/admin` → 🗑 Auto-Delete)
+**Auto-Delete** (🗑 Auto-Delete)
 - Preset buttons: `10m`, `1h`, `6h`.
-- `🔴 Off` — auto-delete band karne ke liye.
-- `✏️ Custom` — kisi bhi doosri value ke liye text-prompt.
+- `🔴 Off` — band karne ke liye.
+- `✏️ Custom` — koi aur value.
 
-**Revoke Token** (`/admin` → ❌ Revoke Token)
-- Sabhi active (non-revoked, non-expired) tokens ki ek button-list dikhti hai; 10 se zyada hone par pagination (`⏮ Prev` / `Next ⏭`) available hai.
-- Token select karne par ek confirmation step aata hai (`✅ Confirm Revoke` / `🔙 Cancel`) taaki accidental tap se koi token galti se revoke na ho.
+**Rate-Limit Settings** (🤖 Rate-Limit Settings) — naya section:
+- **Count** — kitni baar redeem karne ke baad limit lagegi (default: 3).
+- **Window** — kitne seconds ke andar wo count hona chahiye (default: 60s).
+- **Cooldown** — limit lagne pe kitni der rukna padega (default: 30s).
+- **Message** — cooldown ka text, `{s}` likhne se wahan remaining seconds fill ho jaata hai (default: `Wait {s}s....`).
 
-**Generate Token** (`/admin` → 🔑 Generate Token) — ek 6-step guided wizard:
+**Revoke Token** (❌ Revoke Token)
+- Sabhi active tokens ki button-list, pagination ke saath (10 se zyada hone par).
+- Select karne pe confirmation step aata hai, accidental revoke se bachne ke liye.
 
-| Step | Kya poocha jaata hai | Input type |
+**Generate Token** (🔑 Generate Token) — 6-step guided wizard:
+
+| Step | Kya poocha jaata hai | Input |
 |---|---|---|
-| 1 | File ID(s) / range | Typing (unavoidable) |
-| 2 | Token ka naam | Typing (unavoidable) |
-| 3 | Usage Limit | `Set Limit` (typing follow karta hai) ya `Skip` |
-| 4 | Custom Expiry | `Set Expiry` (typing follow karta hai) ya `Skip` |
-| 5 | Auto-Delete override | `Force ON` / `Force OFF` / `Skip` (sab button se) |
-| 6 | Deep-link chahiye? | `Yes` / `No` (button se) |
+| 1 | File ID(s) / range | Typing |
+| 2 | Token ka naam | Typing |
+| 3 | Usage Limit | `Set Limit` ya `Skip` |
+| 4 | Custom Expiry | `Set Expiry` ya `Skip` |
+| 5 | Auto-Delete override | `Force ON` / `Force OFF` / `Skip` |
+| 6 | Deep-link chahiye? | `Yes` / `No` |
 
-Aakhri step ek summary screen dikhata hai (sab selected values ke saath) jahan se `✅ Generate Token` ya `🔙 Cancel` chuna jaata hai. Kisi bhi step par `🔙 Cancel` poore wizard ko discard kar deta hai.
+Aakhri step ek summary dikhata hai, jahan se `✅ Generate Token` ya `🔙 Cancel` chuna jaata hai.
 
-### Button-Based Panel: Fayde aur Trade-offs
+## Default Messages
 
-**Fayde:**
-- Format yaad rakhne ki zaroorat nahi — pehle marker-syntax (`|L:99|`, `|E:2h|`, `|T|`, `?LINK`) type karna padta tha, ab guided steps se sab set hota hai.
-- Typo/format-error ki gunjaish kaafi kam ho jaati hai kyunki zyadatar values button-tap se aati hain, free text se nahi.
-- Revoke ke liye token ka naam yaad rakh ke type karna nahi padta — list mein se select kiya ja sakta hai.
+Ye saare messages by default sirf ek emoji hain — agar chaho to `/admin` → ✏️ Edit Messages se inme text/extra-messages add kar sakte ho:
 
-**Trade-offs:**
-- Ek token generate karne mein pehle ek single-line command se kaam ho jaata tha; ab 6 sequential steps hain, isliye ek token banane mein zyada taps/messages lagte hain.
-- Wizard ki state (`pending_action`) in-memory hai (database mein persist nahi hoti). Agar bot process kisi wizard ke beech mein restart ho jaaye, to wo in-progress token generation discard ho jaata hai aur admin ko dobara shuru karna padta hai.
-- Power-users jo purana marker-format yaad rakh ke fast bulk-generate karte the, unke liye ye flow dheema lag sakta hai.
+| Message | Kab trigger hota hai | Default |
+|---|---|---|
+| `welcome` | Naya user `/start` kare (FSUB pending) | 🧑‍💻 |
+| `verified` | User join-check pass kar le (bina FSUB ke seedha) | 🪪 |
+| `not_joined` | User FSUB channel join nahi kiya | 🗝️ |
+| `restricted` | Token ki koi file DB channel mein nahi mili (deleted/service message) | 🚫 |
+| `admin_welcome` | Admin khud `/start` kare | ✅ |
+| `sending` | Token valid hai, files bhejna shuru | 📤 |
+| `invalid_token` | Token galat/expired/revoked hai | ❌ |
 
-### Tech Stack
+## Tech Stack
 
 | Cheez | Use |
 |---|---|
@@ -81,14 +90,14 @@ Aakhri step ek summary screen dikhata hai (sab selected values ke saath) jahan s
 | [TgCrypto](https://github.com/pyrogram/tgcrypto) | Pyrogram ke liye fast encryption |
 | [Motor](https://motor.readthedocs.io/) | Async MongoDB driver |
 | MongoDB | Settings + tokens + users store karne ke liye |
-| python-dotenv | `.env` file se config load karne ke liye |
+| python-dotenv | `.env` se config load karne ke liye |
 
-### Setup
+## Setup
 
 **1. Repo clone karo**
 ```bash
-git clone https://github.com/Kissu-TheDev/KissuDrop.git
-cd KissuDrop
+git clone https://github.com/Kissu-TheDev/CloudBot.git
+cd CloudBot
 ```
 
 **2. Dependencies install karo**
@@ -97,8 +106,6 @@ pip install -r requirements.txt
 ```
 
 **3. `.env` file banao**
-
-`.env.example` ko copy karke `.env` banao aur values bharo:
 ```bash
 cp .env.example .env
 ```
@@ -109,33 +116,32 @@ cp .env.example .env
 | `API_ID` | [my.telegram.org](https://my.telegram.org) | Haan |
 | `API_HASH` | [my.telegram.org](https://my.telegram.org) | Haan |
 | `MONGODB_URL` | [MongoDB Atlas](https://www.mongodb.com/atlas) connection string | Haan |
-| `ADMIN_ID` | Apni Telegram numeric user ID (e.g. via [@userinfobot](https://t.me/userinfobot)) | Haan |
-| `DB_CHANNEL_ID` | Jis channel mein files store karoge uski ID | Optional (baad mein `/admin` panel se bhi set ho sakti hai) |
+| `ADMIN_ID` | Apni Telegram numeric user ID (e.g. [@userinfobot](https://t.me/userinfobot) se) | Haan |
+| `DB_CHANNEL_ID` | Jis channel mein files store karoge uski ID | Optional (`/admin` se bhi set ho sakti hai) |
 
-**4. Bot ko run karo**
+**4. Bot run karo**
 ```bash
 python bot.py
 ```
+Terminal mein `KissuCloudBot is alive!` dikhega — bot chalu ho gaya.
 
-Terminal mein `KissuCloudBot is alive!` dikhega — matlab bot chalu ho gaya.
+## Use Kaise Karein (Admin)
 
-### Use Kaise Karein (Admin)
-
-1. Bot ko apne DB channel mein **admin** banao (warna wo files copy nahi kar payega).
-2. Bot ko `/start` karo apne (admin) account se → seedha admin panel ka button milega.
+1. Bot ko apne DB channel mein **admin** banao.
+2. Apne account se `/start` karo → seedha admin panel ka button milega.
 3. `/admin` se panel kabhi bhi khol sakte ho.
 
-### Jaani-Maani Limitations (Honest Disclosure)
+## Jaani-Maani Limitations (Honest Disclosure)
 
-- **FSUB check fail-closed hai**: agar member-check ke dauraan koi error aata hai (jaise bot us channel ka admin nahi hai), to user ko *not-joined* treat kiya jaata hai, bypass nahi hone diya jaata. Trade-off: agar bot galti se FSUB channel ka admin nahi raha, to sab users block ho jayenge. `/admin` → **Debug** panel se FSUB status samay-samay par check karte rehna zaroori hai.
-- **Single admin only**: `ADMIN_ID` ek hi ID leta hai — built-in multiple-admin support nahi hai.
-- **No rate-limiting on token guesses**: users jitni baar chahein galat token try kar sakte hain, koi cooldown/lockout nahi hai.
-- **In-memory wizard state**: Generate Token wizard ki progress bot restart hone par lost ho jaati hai (upar "Trade-offs" section mein detail hai).
-- Ye actual "cloud storage" nahi hai — sab kuch Telegram ke DB channel par depend karta hai; wo channel delete/leave hui to delivery break ho jaayegi.
+- **FSUB fail-closed hai** — agar bot kabhi FSUB channel ka admin nahi raha, sab users block ho jaayenge. `/admin` → Debug se check karte raho.
+- **Single admin only** — `ADMIN_ID` ek hi ID leta hai.
+- **Rate-limit in-memory hai** — bot restart hote hi sabke redemption-history clear ho jaati hai (koi user galti se dobara "fresh" ho jaata hai, harmless hai).
+- **Wizard state bhi in-memory hai** — agar bot Generate Token wizard ke beech restart ho jaaye, wo progress discard ho jaata hai.
+- Ye asli "cloud storage" nahi hai — sab kuch Telegram ke DB channel pe depend karta hai.
 
-### Folder Structure
+## Folder Structure
 ```
-KissuDrop/
+CloudBot/
 ├── bot.py            # Poora bot logic (single file)
 ├── requirements.txt  # Python dependencies
 └── .env.example      # Config template
@@ -143,135 +149,6 @@ KissuDrop/
 
 ---
 
-## 🇬🇧 English
+## English (Summary)
 
-### What This Bot Does
-
-1. The admin stores files in a private Telegram channel (the "DB Channel").
-2. The admin generates a token for those files through the admin panel (format: `Kissu-<name>`).
-3. The token is shared with a user manually — the bot does not generate a shareable link on its own unless a deep-link is explicitly requested.
-4. The user runs `/start`. If a force-subscribe (FSUB) channel is configured, joining it is required first.
-5. The user sends the token, and the bot copies the corresponding files from the DB channel to deliver them.
-6. If auto-delete is enabled, delivered files are automatically removed from the user's chat after a set delay.
-
-### Features
-
-- **Token system** — supports single files, ranges (`4-8`), or multiple ranges (`4-8 20-25`) in one token.
-- **Usage limits** — caps the number of times a token can be redeemed.
-- **Force Subscribe (FSUB)** — gates delivery behind joining a channel. The membership check is fail-closed: if an error occurs during the check (e.g. the bot lacks admin rights in that channel), the user is treated as not joined rather than allowed through.
-- **Auto-delete** — delivered files are removed after a configurable delay.
-- **Content protection** — Telegram's `protect_content` flag can optionally block forwarding/saving.
-- **Custom messages** — welcome, verified, sending, invalid-token, and not-joined states are editable from the admin panel, including extra follow-up messages.
-- **Broadcast** — send a message to all users or to specific channels.
-- **Export/import settings** — back up or restore the entire configuration as JSON.
-- **Debug panel** — shows total users, active tokens, and DB/FSUB status.
-- **Pagination** — large token batches are delivered in pages of 10, with a "Next" button.
-- **FloodWait handling** — the bot waits and retries automatically when Telegram rate-limits it.
-
-### Admin Panel — Button-Based Workflow
-
-Interaction with the admin panel is now primarily through inline buttons. Typing is required only where a genuinely free-form value is needed: a file ID, a token name, or a custom number/time.
-
-**Set Timer** (`/admin` → Set Timer)
-- Preset buttons: `30m`, `1h`, `6h`, `1d` — tapping one sets the default expiry immediately.
-- `Custom` — opens a text prompt for any other value (format: `1h`, `30m`, `1d`).
-
-**Auto-Delete** (`/admin` → Auto-Delete)
-- Preset buttons: `10m`, `1h`, `6h`.
-- `Off` — disables auto-delete.
-- `Custom` — text prompt for any other value.
-
-**Revoke Token** (`/admin` → Revoke Token)
-- Displays a button list of all active (non-revoked, non-expired) tokens, with pagination (`Prev` / `Next`) when there are more than 10.
-- Selecting a token requires confirmation (`Confirm Revoke` / `Cancel`) to reduce the chance of an accidental revocation.
-
-**Generate Token** (`/admin` → Generate Token) — a 6-step guided wizard:
-
-| Step | Prompt | Input type |
-|---|---|---|
-| 1 | File ID(s) / range | Typed (unavoidable) |
-| 2 | Token name | Typed (unavoidable) |
-| 3 | Usage limit | `Set Limit` (followed by typed input) or `Skip` |
-| 4 | Custom expiry | `Set Expiry` (followed by typed input) or `Skip` |
-| 5 | Auto-delete override | `Force ON` / `Force OFF` / `Skip` (all buttons) |
-| 6 | Deep-link | `Yes` / `No` (buttons) |
-
-The final step shows a summary of all selected values with `Generate Token` / `Cancel` options. `Cancel` at any step discards the wizard entirely.
-
-### Button-Based Panel: Benefits and Trade-offs
-
-**Benefits:**
-- No need to memorize a format — the previous marker syntax (`|L:99|`, `|E:2h|`, `|T|`, `?LINK`) has been replaced with guided, sequential steps.
-- Lower chance of typos or malformed input, since most values now come from button taps rather than free text.
-- Revoking a token no longer requires remembering and typing its name — it can be selected from a list.
-
-**Trade-offs:**
-- Generating a token previously took one line of text; it now takes 6 sequential steps, meaning more taps/messages per token.
-- Wizard state (`pending_action`) is held in memory, not persisted to the database. If the bot process restarts mid-wizard, the in-progress token generation is lost and must be restarted.
-- Admins who relied on the old marker format for fast bulk generation may find this flow slower.
-
-### Tech Stack
-
-| Component | Purpose |
-|---|---|
-| [Pyrogram](https://docs.pyrogram.org/) | Telegram MTProto client (bot framework) |
-| [TgCrypto](https://github.com/pyrogram/tgcrypto) | Fast encryption backend for Pyrogram |
-| [Motor](https://motor.readthedocs.io/) | Async MongoDB driver |
-| MongoDB | Stores settings, tokens, and users |
-| python-dotenv | Loads config from `.env` |
-
-### Setup
-
-**1. Clone the repo**
-```bash
-git clone https://github.com/Kissu-TheDev/KissuDrop.git
-cd KissuDrop
-```
-
-**2. Install dependencies**
-```bash
-pip install -r requirements.txt
-```
-
-**3. Create your `.env` file**
-```bash
-cp .env.example .env
-```
-
-| Variable | Where to get it | Required? |
-|---|---|---|
-| `BOT_TOKEN` | Create a bot via [@BotFather](https://t.me/BotFather) | Yes |
-| `API_ID` | [my.telegram.org](https://my.telegram.org) | Yes |
-| `API_HASH` | [my.telegram.org](https://my.telegram.org) | Yes |
-| `MONGODB_URL` | [MongoDB Atlas](https://www.mongodb.com/atlas) connection string | Yes |
-| `ADMIN_ID` | Your numeric Telegram user ID (e.g. via [@userinfobot](https://t.me/userinfobot)) | Yes |
-| `DB_CHANNEL_ID` | ID of the channel you store files in | Optional (can also be set later via the `/admin` panel) |
-
-**4. Run the bot**
-```bash
-python bot.py
-```
-
-The terminal will display `KissuCloudBot is alive!` once the bot is running.
-
-### How to Use (Admin)
-
-1. Make the bot an **admin** in your DB channel — otherwise it cannot copy files from it.
-2. Run `/start` with your admin account to get a direct button to open the admin panel.
-3. Open the panel at any time with `/admin`.
-
-### Known Limitations (Honest Disclosure)
-
-- **FSUB check is fail-closed**: if an error occurs while checking channel membership (e.g. the bot isn't an admin in that channel), the user is treated as not joined rather than passed through. Trade-off: if the bot loses admin rights in the FSUB channel, every user will be blocked. Check FSUB status periodically via `/admin` → **Debug**.
-- **Single admin only**: `ADMIN_ID` accepts a single ID — there is no built-in multi-admin support.
-- **No rate-limiting on token guesses**: users can attempt any number of token strings with no cooldown or lockout.
-- **In-memory wizard state**: Generate Token wizard progress is lost if the bot restarts mid-flow (see "Trade-offs" above for detail).
-- This is not real "cloud storage" — everything depends on the Telegram DB channel; if that channel is deleted or access is lost, delivery breaks.
-
-### Folder Structure
-```
-KissuDrop/
-├── bot.py            # Full bot logic (single file)
-├── requirements.txt  # Python dependencies
-└── .env.example      # Config template
-```
+CloudBot is a token-gated Telegram file-delivery bot — files live in a private "DB Channel" and are copied to users only against a valid token. It supports per-token usage limits, custom expiry, auto-delete overrides, deep-links, force-subscribe gating (fail-closed), per-user rate-limiting, and a fully button-driven admin panel (`/admin`). See the Hinglish sections above for full setup and usage details — the two versions cover the same content.

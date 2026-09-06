@@ -47,6 +47,13 @@ users_col = db["users"]  # broadcast ke liye track karte hain kaun kaun /start k
 PAGE_SIZE = 10
 pending_action = {}  # { user_id: "awaiting_xxx" }
 BOT_USERNAME = None  # startup pe app.get_me() se fill hoga, deep-link banane ke liye
+redemption_times = {}  # { user_id: [timestamp1, timestamp2, ...] } — rate-limit ke liye recent redemption history
+
+# Rate-limit defaults — sab kuch /admin se customize ho sakta hai (config me store hote hain)
+DEFAULT_RATELIMIT_COUNT = 3        # kitni baar redeem karne ke baad cooldown lage
+DEFAULT_RATELIMIT_WINDOW = 60      # kitne seconds ke andar wo count hona chahiye
+DEFAULT_RATELIMIT_WAIT = 30        # cooldown kitni der ka ho (seconds)
+DEFAULT_RATELIMIT_MESSAGE = "Wait {s}s...."  # {s} me remaining seconds fill hota hai
 
 # ==========================================
 # 💬 DEFAULT CUSTOMIZABLE MESSAGES
@@ -56,9 +63,11 @@ BOT_USERNAME = None  # startup pe app.get_me() se fill hoga, deep-link banane ke
 DEFAULT_MESSAGES = {
     "welcome": {"text": "🧑‍💻", "extra": []},
     "verified": {"text": "🪪", "extra": []},
+    "not_joined": {"text": "🗝️", "extra": []},
+    "restricted": {"text": "🚫", "extra": []},
+    "admin_welcome": {"text": "✅", "extra": []},
     "sending": {"text": "📤", "extra": []},
     "invalid_token": {"text": "❌", "extra": []},
-    "not_joined": {"text": "❌ Pehle channel join karo.", "extra": []},
 }
 
 
@@ -167,6 +176,7 @@ async def admin_panel_markup():
          InlineKeyboardButton("❌ Revoke Token", callback_data="panel_revoke")],
         [InlineKeyboardButton("🔍 Search/List Tokens", callback_data="panel_search")],
         [InlineKeyboardButton(f"🔒 Content Protection: {protect_status}", callback_data="panel_toggleprotect")],
+        [InlineKeyboardButton("🤖 Rate-Limit Settings", callback_data="panel_ratelimit")],
         [InlineKeyboardButton("✏️ Edit Messages", callback_data="panel_editmsg")],
         [InlineKeyboardButton("📣 Broadcast", callback_data="panel_broadcast"),
          InlineKeyboardButton("🐞 Debug", callback_data="panel_debug")],
@@ -312,14 +322,14 @@ def gtf_summary_text(data):
 
 @app.on_message(filters.command("start") & filters.private & filters.user(ADMIN_ID))
 async def admin_start(client, message):
-    """Admin ke liye /start alag hai - seedha 🔐 + panel button."""
+    """Admin ke liye /start alag hai - customizable admin_welcome message + panel button."""
     await users_col.update_one(
         {"_id": message.from_user.id},
         {"$set": {"_id": message.from_user.id, "first_seen": datetime.now()}},
         upsert=True
     )
     buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Open Admin Panel", callback_data="panel_open")]])
-    await message.reply_text("🔐", reply_markup=buttons)
+    await send_custom(client, message.chat.id, "admin_welcome", reply_markup=buttons)
 
 
 @app.on_message(filters.command("admin") & filters.user(ADMIN_ID))
@@ -355,6 +365,30 @@ async def panel_callback(client, callback_query):
         return await callback_query.message.edit_text(
             "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
         )
+
+    if action == "ratelimit":
+        config = await get_config()
+        count = config.get("ratelimit_count", DEFAULT_RATELIMIT_COUNT)
+        window = config.get("ratelimit_window", DEFAULT_RATELIMIT_WINDOW)
+        wait = config.get("ratelimit_wait", DEFAULT_RATELIMIT_WAIT)
+        msg_template = config.get("ratelimit_message", DEFAULT_RATELIMIT_MESSAGE)
+        text = (
+            f"🤖 **Rate-Limit Settings**\n\n"
+            f"**Count:** {count} baar\n"
+            f"**Window:** {window}s ke andar\n"
+            f"**Cooldown:** {wait}s\n"
+            f"**Message:** `{msg_template}`\n\n"
+            f"Matlab: {window}s ke andar {count} baar redeem kiya to agla attempt {wait}s ke liye block hoga."
+        )
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔢 Count Badlo", callback_data="rl_setcount"),
+             InlineKeyboardButton("⏱ Window Badlo", callback_data="rl_setwindow")],
+            [InlineKeyboardButton("⏳ Cooldown Badlo", callback_data="rl_setwait"),
+             InlineKeyboardButton("✏️ Message Badlo", callback_data="rl_setmessage")],
+            [InlineKeyboardButton("🔙 Back", callback_data="panel_back")],
+        ])
+        await callback_query.answer()
+        return await callback_query.message.edit_text(text, reply_markup=buttons)
 
     if action == "editmsg":
         return await callback_query.message.edit_text(
@@ -393,7 +427,9 @@ async def panel_callback(client, callback_query):
             f"⏱ Default Timer: `{config.get('default_timer', '1h')}`\n"
         )
         await callback_query.answer()
-        return await callback_query.message.reply_text(debug_text)
+        return await callback_query.message.edit_text(
+            debug_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
+        )
 
     if action == "search":
         now = datetime.now()
@@ -413,7 +449,9 @@ async def panel_callback(client, callback_query):
         if count == 0:
             lines.append("_Koi active token nahi hai._")
         await callback_query.answer()
-        return await callback_query.message.reply_text("\n".join(lines))
+        return await callback_query.message.edit_text(
+            "\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
+        )
 
     if action == "broadcast":
         buttons = InlineKeyboardMarkup([
@@ -429,13 +467,16 @@ async def panel_callback(client, callback_query):
         config.pop("_id", None)
         json_str = json.dumps(config, indent=2, default=str)
         await callback_query.answer()
-        return await callback_query.message.reply_text(f"📤 **Settings Export:**\n\n```json\n{json_str}\n```")
+        return await callback_query.message.edit_text(
+            f"📤 **Settings Export:**\n\n```json\n{json_str}\n```",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
+        )
 
     if action == "import":
         pending_action[user_id] = "awaiting_import"
         back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
         await callback_query.answer()
-        return await callback_query.message.reply_text(
+        return await callback_query.message.edit_text(
             "📥 Wo JSON paste karke bhej jo pehle export kiya tha:", reply_markup=back_btn
         )
 
@@ -474,7 +515,7 @@ async def panel_callback(client, callback_query):
     }
     pending_action[user_id] = f"awaiting_{action}"
     await callback_query.answer()
-    await callback_query.message.reply_text(prompts[action], reply_markup=back_btn)
+    await callback_query.message.edit_text(prompts[action], reply_markup=back_btn)
 
 
 @app.on_callback_query(filters.regex(r"^stmr_") & filters.user(ADMIN_ID))
@@ -684,6 +725,23 @@ async def editmsg_callback(client, callback_query):
     )
 
 
+@app.on_callback_query(filters.regex(r"^rl_") & filters.user(ADMIN_ID))
+async def ratelimit_callback(client, callback_query):
+    field = callback_query.data.split("_", 1)[1]  # setcount / setwindow / setwait / setmessage
+    user_id = callback_query.from_user.id
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_ratelimit")]])
+
+    prompts = {
+        "setcount": "🔢 Kitni baar redeem karne ke baad limit lage, number bhej (e.g. `3`):",
+        "setwindow": "⏱ Kitne seconds ke andar wo count hona chahiye, number bhej (e.g. `60`):",
+        "setwait": "⏳ Cooldown kitni der ka ho, seconds me bhej (e.g. `30`):",
+        "setmessage": "✏️ Naya message bhej. `{s}` likhne se wahan remaining seconds fill hoga (e.g. `Wait {s}s....`):",
+    }
+    pending_action[user_id] = f"awaiting_rl_{field}"
+    await callback_query.answer()
+    await callback_query.message.edit_text(prompts[field], reply_markup=back_btn)
+
+
 @app.on_callback_query(filters.regex(r"^bcast_") & filters.user(ADMIN_ID))
 async def bcast_callback(client, callback_query):
     kind = callback_query.data.split("_", 1)[1]  # "users" ya "channels"
@@ -865,6 +923,28 @@ async def handle_admin_pending(client, message):
             await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": seconds}}, upsert=True)
             await message.reply_text(f"✅ Files ab {text} baad auto-delete hongi.")
 
+    elif action == "awaiting_rl_setcount":
+        if not text.isdigit() or int(text) < 1:
+            return await message.reply_text("❌ Ye ek valid positive number nahi hai — dobara bhej.")
+        await settings_col.update_one({"_id": "config"}, {"$set": {"ratelimit_count": int(text)}}, upsert=True)
+        await message.reply_text(f"✅ Rate-limit count set ho gaya: {text} baar")
+
+    elif action == "awaiting_rl_setwindow":
+        if not text.isdigit() or int(text) < 1:
+            return await message.reply_text("❌ Ye ek valid positive number nahi hai (seconds me) — dobara bhej.")
+        await settings_col.update_one({"_id": "config"}, {"$set": {"ratelimit_window": int(text)}}, upsert=True)
+        await message.reply_text(f"✅ Rate-limit window set ho gaya: {text}s")
+
+    elif action == "awaiting_rl_setwait":
+        if not text.isdigit() or int(text) < 1:
+            return await message.reply_text("❌ Ye ek valid positive number nahi hai (seconds me) — dobara bhej.")
+        await settings_col.update_one({"_id": "config"}, {"$set": {"ratelimit_wait": int(text)}}, upsert=True)
+        await message.reply_text(f"✅ Rate-limit cooldown set ho gaya: {text}s")
+
+    elif action == "awaiting_rl_setmessage":
+        await settings_col.update_one({"_id": "config"}, {"$set": {"ratelimit_message": text}}, upsert=True)
+        await message.reply_text(f"✅ Rate-limit message set ho gaya:\n`{text}`")
+
     elif action.startswith("awaiting_editmsg_"):
         key = action.replace("awaiting_editmsg_", "")
         bits = text.split("|||")
@@ -1008,9 +1088,9 @@ async def send_batch(client, chat_id, token_data, offset):
                 if auto_delete_seconds > 0:
                     asyncio.create_task(schedule_delete(client, chat_id, sent.id, auto_delete_seconds))
             except Exception as e:
-                await client.send_message(chat_id, f"🚫")
+                await send_custom(client, chat_id, "restricted")
         except Exception as e:
-            await client.send_message(chat_id, f"🚫")
+            await send_custom(client, chat_id, "restricted")
 
     next_offset = offset + PAGE_SIZE
     total_files = len(all_files)
@@ -1019,10 +1099,6 @@ async def send_batch(client, chat_id, token_data, offset):
             "Next ⏭", callback_data=f"next_{token_data['token_id']}_{next_offset}"
         )]])
         await client.send_message(chat_id, f"({min(next_offset, total_files)}/{total_files} files sent)", reply_markup=buttons)
-
-    if auto_delete_seconds > 0:
-        unit_label = f"{auto_delete_seconds // 60}m" if auto_delete_seconds >= 60 else f"{auto_delete_seconds}s"
-        await client.send_message(chat_id, f"⚠️ Ye files {unit_label} me delete ho jayengi.")
 
 
 @app.on_callback_query(filters.regex(r"^next_"))
@@ -1045,9 +1121,40 @@ async def next_batch_callback(client, callback_query):
 # 🚀 USER FLOW (non-admin): /start -> welcome + Join/Verify -> verified -> token -> sending
 # ==========================================
 
+async def check_rate_limit(user_id):
+    """Sliding-window rate limit: last WINDOW seconds me COUNT ya usse zyada
+    redeem kiye to True (blocked) + fixed wait_seconds cooldown return karta hai."""
+    config = await get_config()
+    count_limit = config.get("ratelimit_count", DEFAULT_RATELIMIT_COUNT)
+    window = config.get("ratelimit_window", DEFAULT_RATELIMIT_WINDOW)
+    wait_seconds = config.get("ratelimit_wait", DEFAULT_RATELIMIT_WAIT)
+
+    now = datetime.now().timestamp()
+    history = redemption_times.get(user_id, [])
+    # Window ke bahar wale purane timestamps hata do
+    history = [t for t in history if now - t < window]
+    redemption_times[user_id] = history
+
+    if len(history) >= count_limit:
+        return True, wait_seconds
+    return False, wait_seconds
+
+
+def record_redemption(user_id):
+    now = datetime.now().timestamp()
+    redemption_times.setdefault(user_id, []).append(now)
+
+
 async def redeem_token(client, message, token):
     """Token check + file delivery — plain-text token aur deep-link (/start token) dono se call hota hai."""
     user_id = message.from_user.id
+
+    is_limited, wait_seconds = await check_rate_limit(user_id)
+    if is_limited:
+        config = await get_config()
+        template = config.get("ratelimit_message", DEFAULT_RATELIMIT_MESSAGE)
+        text = template.replace("{s}", str(wait_seconds))
+        return await message.reply_text(f"🤖\n{text}")
 
     if not await is_fsub_joined(client, user_id):
         config = await get_config()
@@ -1070,6 +1177,7 @@ async def redeem_token(client, message, token):
     if usage_limit is not None and used_count >= usage_limit:
         return await message.reply_text("❌ Ye token apni usage limit tak pahuch chuka hai.")
 
+    record_redemption(user_id)
     await tokens_col.update_one({"token_id": token}, {"$inc": {"used_count": 1}})
 
     await send_custom(client, message.chat.id, "sending")
