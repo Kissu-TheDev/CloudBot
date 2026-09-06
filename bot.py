@@ -152,59 +152,6 @@ def parse_ranges(parts):
 
 
 # ==========================================
-# 🏷 TOKEN OPTIONS PARSER (naam + optional markers)
-# Format: "Cutie |L:99| |E:2h| |T| ?LINK"  (order matter nahi karta markers ka)
-#  - naam: pehla plain word (koi marker match na kare)
-#  - |L:99| : usage limit (optional, default = unlimited)
-#  - |E:2h| : per-token expiry (optional, default = admin ka global default_timer)
-#  - |T| ya |F| : auto-delete override (optional, default = admin ka global setting)
-#  - ?LINK : deep-link bhi generate karo (optional, default = sirf token)
-# ==========================================
-def parse_token_options(parts):
-    """
-    parts: naam + baad ke saare tokens (jaise ["Cutie", "|L:99|", "|E:2h|", "|T|", "?LINK"])
-    Returns: (name, usage_limit, expiry_seconds, auto_delete_override, want_link, error_message_or_None)
-      expiry_seconds: int (custom) ya None (None = global default_timer follow karo)
-      auto_delete_override: True / False / None (None = global setting follow karo)
-    """
-    name = None
-    usage_limit = None
-    expiry_seconds = None
-    auto_delete_override = None
-    want_link = False
-
-    for part in parts:
-        if part == "?LINK":
-            want_link = True
-        elif part == "|T|":
-            auto_delete_override = True
-        elif part == "|F|":
-            auto_delete_override = False
-        elif part.startswith("|L:") and part.endswith("|"):
-            num_str = part[3:-1]
-            if not num_str.isdigit():
-                return None, None, None, None, False, f"❌ `{part}` me limit number nahi hai (format: `|L:99|`)."
-            usage_limit = int(num_str)
-        elif part.startswith("|E:") and part.endswith("|"):
-            time_str = part[3:-1]
-            seconds = parse_time(time_str)
-            if seconds is None:
-                return None, None, None, None, False, f"❌ `{part}` me time format galat hai (format: `|E:2h|`, `|E:30m|`, `|E:1d|`)."
-            expiry_seconds = seconds
-        elif part.startswith("|") or part.startswith("?"):
-            return None, None, None, None, False, f"❌ `{part}` samajh nahi aaya. Valid markers: `|L:number|`, `|E:time|`, `|T|`, `|F|`, `?LINK`."
-        else:
-            if name is not None:
-                return None, None, None, None, False, f"❌ Do naam mile (`{name}` aur `{part}`) — sirf ek naam allowed hai."
-            name = part
-
-    if name is None:
-        return None, None, None, None, False, "❌ Koi naam nahi mila — naam zaroori hai (files ke baad)."
-
-    return name, usage_limit, expiry_seconds, auto_delete_override, want_link, None
-
-
-# ==========================================
 # 🛠 ADMIN PANEL
 # ==========================================
 
@@ -236,6 +183,131 @@ def edit_msg_markup():
         rows.append([InlineKeyboardButton(k, callback_data=f"editmsg_{k}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="panel_back")])
     return InlineKeyboardMarkup(rows)
+
+
+# ==========================================
+# ⏱ SET TIMER / 🗑 AUTO-DELETE — button menus
+# Presets seedha save hote hain; "Custom" purane text-prompt flow
+# (awaiting_settimer / awaiting_autodelete) me gira deta hai.
+# ==========================================
+def settimer_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("30m", callback_data="stmr_30m"),
+         InlineKeyboardButton("1h", callback_data="stmr_1h"),
+         InlineKeyboardButton("6h", callback_data="stmr_6h"),
+         InlineKeyboardButton("1d", callback_data="stmr_1d")],
+        [InlineKeyboardButton("✏️ Custom", callback_data="stmr_custom")],
+        [InlineKeyboardButton("🔙 Back", callback_data="panel_back")],
+    ])
+
+
+def autodelete_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("10m", callback_data="adel_10m"),
+         InlineKeyboardButton("1h", callback_data="adel_1h"),
+         InlineKeyboardButton("6h", callback_data="adel_6h")],
+        [InlineKeyboardButton("🔴 Off", callback_data="adel_off"),
+         InlineKeyboardButton("✏️ Custom", callback_data="adel_custom")],
+        [InlineKeyboardButton("🔙 Back", callback_data="panel_back")],
+    ])
+
+
+# ==========================================
+# ❌ REVOKE TOKEN — button list (typing ki zaroorat nahi)
+# ==========================================
+async def build_revoke_list_view(offset=0):
+    now = datetime.now()
+    cursor = tokens_col.find({"revoked": False, "expiry_time": {"$gt": now}}).sort("expiry_time", 1)
+    all_tokens = [t async for t in cursor]
+
+    if not all_tokens:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
+        return "❌ Revoke karne ke liye koi active token nahi hai.", markup
+
+    page = all_tokens[offset: offset + PAGE_SIZE]
+    rows = []
+    for t in page:
+        label = f"{t['token_id']} ({len(t['files'])} files)"
+        rows.append([InlineKeyboardButton(label, callback_data=f"rvk_{t['token_id']}")])
+
+    nav_row = []
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"rvkpage_{max(0, offset - PAGE_SIZE)}"))
+    if offset + PAGE_SIZE < len(all_tokens):
+        nav_row.append(InlineKeyboardButton("Next ⏭", callback_data=f"rvkpage_{offset + PAGE_SIZE}"))
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="panel_back")])
+    text = f"❌ **Revoke Token** — jo revoke karna hai chuno ({len(all_tokens)} active):"
+    return text, InlineKeyboardMarkup(rows)
+
+
+# ==========================================
+# 🔑 GENERATE TOKEN WIZARD — button menus per step
+# Typing sirf 4 jagah: files, naam, limit-value, expiry-value.
+# Baaki sab (limit-choice, expiry-choice, auto-delete, link, confirm) buttons se.
+# ==========================================
+def gtf_limit_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 Set Limit", callback_data="gtf_setlimit"),
+         InlineKeyboardButton("⏭ Skip (Unlimited)", callback_data="gtf_skiplimit")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="gtf_cancel")],
+    ])
+
+
+def gtf_expiry_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏱ Set Expiry", callback_data="gtf_setexpiry"),
+         InlineKeyboardButton("⏭ Skip (Global Default)", callback_data="gtf_skipexpiry")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="gtf_cancel")],
+    ])
+
+
+def gtf_autodelete_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Force ON", callback_data="gtf_adon"),
+         InlineKeyboardButton("🔴 Force OFF", callback_data="gtf_adoff")],
+        [InlineKeyboardButton("⏭ Skip (Global Setting)", callback_data="gtf_adskip")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="gtf_cancel")],
+    ])
+
+
+def gtf_link_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Yes", callback_data="gtf_linkyes"),
+         InlineKeyboardButton("🚫 No", callback_data="gtf_linkno")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="gtf_cancel")],
+    ])
+
+
+def gtf_confirm_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Generate Token", callback_data="gtf_generate")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="gtf_cancel")],
+    ])
+
+
+def gtf_cancel_only_markup():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="gtf_cancel")]])
+
+
+def gtf_summary_text(data):
+    limit_text = f"{data['usage_limit']} uses" if data.get("usage_limit") else "Unlimited"
+    expiry_text = data.get("expiry_display") or "Global default"
+    ad = data.get("auto_delete_override")
+    ad_text = "Global setting follow hogi" if ad is None else ("Force ON" if ad else "Force OFF")
+    link_text = "Haan" if data.get("want_link") else "Nahi"
+    return (
+        "🔑 **Naya Token — Confirm**\n\n"
+        f"**Files:** {len(data['file_ids'])}\n"
+        f"**Naam:** {data['name']}\n"
+        f"**Usage Limit:** {limit_text}\n"
+        f"**Expiry:** {expiry_text}\n"
+        f"**Auto-Delete:** {ad_text}\n"
+        f"**Deep-Link:** {link_text}\n\n"
+        "Sab sahi hai?"
+    )
 
 
 @app.on_message(filters.command("start") & filters.private & filters.user(ADMIN_ID))
@@ -367,30 +439,231 @@ async def panel_callback(client, callback_query):
             "📥 Wo JSON paste karke bhej jo pehle export kiya tha:", reply_markup=back_btn
         )
 
+    if action == "settimer":
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "⏱ Default token expiry time chuno:", reply_markup=settimer_markup()
+        )
+
+    if action == "autodelete":
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "🗑 Files kitni der baad auto-delete ho, chuno:", reply_markup=autodelete_markup()
+        )
+
+    if action == "gentoken":
+        pending_action[user_id] = {"flow": "gentoken", "step": "files", "data": {}}
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "🔑 **Naya Token — Step 1/6**\n\n"
+            "File ID(s)/range bhej (space se separate multiple):\n\n"
+            "**Single file:** `101`\n**Range:** `101-112`\n**Multi-range:** `4-8 20-25`",
+            reply_markup=gtf_cancel_only_markup()
+        )
+
+    if action == "revoke":
+        text, markup = await build_revoke_list_view(offset=0)
+        await callback_query.answer()
+        return await callback_query.message.edit_text(text, reply_markup=markup)
+
     back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
 
     prompts = {
         "setfsub": "📢 Pehle FSUB **channel ID** bhej (e.g. `-1001234567890`):",
         "setdb": "🗄 DB channel ki ID bhej (e.g. `-1001234567890`):",
-        "settimer": "⏱ Default token expiry time bhej (e.g. `1h`, `30m`, `1d`):",
-        "autodelete": "🗑 Files kitni der baad auto-delete ho (e.g. `10m`, `1h`). Band karne ke liye `off` bhej:",
-        "gentoken": (
-            "🔑 Format me bhej (ranges/numbers, phir naam, phir optional markers — kisi bhi order me):\n\n"
-            "**Single file:** `101 CuteGirl`\n"
-            "**Range:** `101-112 CuteGirl`\n"
-            "**Multi-range:** `4-8 20-25 VIP`\n"
-            "**Usage limit ke saath:** `4-8 20-25 VIP |L:50|`\n"
-            "**Custom expiry:** `4-8 20-25 VIP |E:2h|` (`|E:30m|`, `|E:1d|` bhi chalega) — na doge to global default timer follow hoga\n"
-            "**Auto-delete override:** `4-8 20-25 VIP |T|` (ON) ya `|F|` (OFF) — na doge to global setting follow hogi\n"
-            "**Deep-link bhi chahiye:** `4-8 20-25 VIP ?LINK`\n"
-            "**Sab ek saath:** `4-8 20-25 VIP |L:50| |E:2h| |T| ?LINK`\n\n"
-            "_Limit na do to unlimited use hoga. Marker order matter nahi karta._"
-        ),
-        "revoke": "❌ Jo token revoke karna hai uska naam bhej (e.g. `Kissu-CuteGirl`):",
     }
     pending_action[user_id] = f"awaiting_{action}"
     await callback_query.answer()
     await callback_query.message.reply_text(prompts[action], reply_markup=back_btn)
+
+
+@app.on_callback_query(filters.regex(r"^stmr_") & filters.user(ADMIN_ID))
+async def settimer_callback(client, callback_query):
+    value = callback_query.data.split("_", 1)[1]
+    user_id = callback_query.from_user.id
+
+    if value == "custom":
+        pending_action[user_id] = "awaiting_settimer"
+        back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "⏱ Default token expiry time bhej (e.g. `1h`, `30m`, `1d`):", reply_markup=back_btn
+        )
+
+    await settings_col.update_one({"_id": "config"}, {"$set": {"default_timer": value}}, upsert=True)
+    await callback_query.answer(f"✅ Default timer set: {value}")
+    await callback_query.message.edit_text(
+        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+    )
+
+
+@app.on_callback_query(filters.regex(r"^adel_") & filters.user(ADMIN_ID))
+async def autodelete_callback(client, callback_query):
+    value = callback_query.data.split("_", 1)[1]
+    user_id = callback_query.from_user.id
+
+    if value == "custom":
+        pending_action[user_id] = "awaiting_autodelete"
+        back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "🗑 Files kitni der baad auto-delete ho (e.g. `10m`, `1h`) bhej:", reply_markup=back_btn
+        )
+
+    if value == "off":
+        await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": 0}}, upsert=True)
+        await callback_query.answer("✅ Auto-delete band kar diya.")
+    else:
+        seconds = parse_time(value)
+        await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": seconds}}, upsert=True)
+        await callback_query.answer(f"✅ Auto-delete set: {value}")
+
+    await callback_query.message.edit_text(
+        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+    )
+
+
+@app.on_callback_query(filters.regex(r"^rvkpage_") & filters.user(ADMIN_ID))
+async def revoke_page_callback(client, callback_query):
+    offset = int(callback_query.data.split("_", 1)[1])
+    text, markup = await build_revoke_list_view(offset=offset)
+    await callback_query.answer()
+    await callback_query.message.edit_text(text, reply_markup=markup)
+
+
+@app.on_callback_query(filters.regex(r"^rvk_") & filters.user(ADMIN_ID))
+async def revoke_select_callback(client, callback_query):
+    token_id = callback_query.data.split("_", 1)[1]
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm Revoke", callback_data=f"rvkc_{token_id}")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="panel_revoke")],
+    ])
+    await callback_query.answer()
+    await callback_query.message.edit_text(f"⚠️ Sure? `{token_id}` revoke karna hai?", reply_markup=buttons)
+
+
+@app.on_callback_query(filters.regex(r"^rvkc_") & filters.user(ADMIN_ID))
+async def revoke_confirm_callback(client, callback_query):
+    token_id = callback_query.data.split("_", 1)[1]
+    result = await tokens_col.update_one({"token_id": token_id}, {"$set": {"revoked": True}})
+    if result.matched_count == 0:
+        await callback_query.answer("❌ Token mila hi nahi.", show_alert=True)
+    else:
+        await callback_query.answer("✅ Token revoke ho gaya.")
+    await callback_query.message.edit_text(
+        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+    )
+
+
+@app.on_callback_query(filters.regex(r"^gtf_") & filters.user(ADMIN_ID))
+async def gentoken_wizard_callback(client, callback_query):
+    action_key = callback_query.data.split("_", 1)[1]
+    user_id = callback_query.from_user.id
+    state = pending_action.get(user_id)
+
+    if action_key == "cancel":
+        pending_action.pop(user_id, None)
+        await callback_query.answer("❌ Cancel kar diya.")
+        return await callback_query.message.edit_text(
+            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+        )
+
+    if not isinstance(state, dict) or state.get("flow") != "gentoken":
+        return await callback_query.answer("⚠️ Session expire ho gaya, `/admin` se dobara try kar.", show_alert=True)
+
+    data = state["data"]
+
+    if action_key == "skiplimit":
+        data["usage_limit"] = None
+        pending_action[user_id] = {"flow": "gentoken", "step": "expiry_choice", "data": data}
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "🔑 **Step 4/6** — Is token ki custom expiry chahiye?", reply_markup=gtf_expiry_markup()
+        )
+
+    if action_key == "setlimit":
+        pending_action[user_id] = {"flow": "gentoken", "step": "limit_value", "data": data}
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "🔢 Kitni baar tak use ho sake, number bhej:", reply_markup=gtf_cancel_only_markup()
+        )
+
+    if action_key == "skipexpiry":
+        data["expiry_override_seconds"] = None
+        data["expiry_display"] = None
+        pending_action[user_id] = {"flow": "gentoken", "step": "autodelete_choice", "data": data}
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "🔑 **Step 5/6** — Auto-delete override karna hai?", reply_markup=gtf_autodelete_markup()
+        )
+
+    if action_key == "setexpiry":
+        pending_action[user_id] = {"flow": "gentoken", "step": "expiry_value", "data": data}
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "⏱ Time bhej (e.g. `1h`, `30m`, `2d`):", reply_markup=gtf_cancel_only_markup()
+        )
+
+    if action_key in ("adon", "adoff", "adskip"):
+        data["auto_delete_override"] = True if action_key == "adon" else (False if action_key == "adoff" else None)
+        pending_action[user_id] = {"flow": "gentoken", "step": "link_choice", "data": data}
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "🔑 **Step 6/6** — Deep-link bhi chahiye?", reply_markup=gtf_link_markup()
+        )
+
+    if action_key in ("linkyes", "linkno"):
+        data["want_link"] = (action_key == "linkyes")
+        pending_action[user_id] = {"flow": "gentoken", "step": "confirm", "data": data}
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            gtf_summary_text(data), reply_markup=gtf_confirm_markup()
+        )
+
+    if action_key == "generate":
+        config = await get_config()
+        if data.get("expiry_override_seconds") is not None:
+            seconds = data["expiry_override_seconds"]
+            expiry_display = data["expiry_display"]
+        else:
+            expiry_display = config.get("default_timer", "1h")
+            seconds = parse_time(expiry_display) or 3600
+
+        token_id = f"Kissu-{data['name']}"
+        await tokens_col.update_one(
+            {"token_id": token_id},
+            {"$set": {
+                "token_id": token_id,
+                "expiry_time": datetime.now() + timedelta(seconds=seconds),
+                "files": data["file_ids"],
+                "revoked": False,
+                "usage_limit": data.get("usage_limit"),
+                "used_count": 0,
+                "auto_delete_override": data.get("auto_delete_override"),
+            }},
+            upsert=True
+        )
+
+        limit_text = f"{data['usage_limit']} uses" if data.get("usage_limit") else "Unlimited"
+        ad = data.get("auto_delete_override")
+        delete_text = "Global setting follow hogi" if ad is None else ("ON" if ad else "OFF")
+
+        reply_text = (
+            f"🔥 **Token Generated!**\n\n**Token:** `{token_id}`\n"
+            f"**Files:** {len(data['file_ids'])}\n**Expires in:** {expiry_display}\n"
+            f"**Usage limit:** {limit_text}\n**Auto-delete:** {delete_text}"
+        )
+        if data.get("want_link"):
+            username = await get_bot_username()
+            if username:
+                deep_link = f"https://t.me/{username}?start={token_id}"
+                reply_text += f"\n**Link:** {deep_link}"
+            else:
+                reply_text += "\n⚠️ Link nahi ban paya — bot username fetch nahi ho saka."
+
+        pending_action.pop(user_id, None)
+        await callback_query.answer("✅ Token generate ho gaya!")
+        return await callback_query.message.edit_text(reply_text)
 
 
 @app.on_callback_query(filters.regex(r"^editmsg_") & filters.user(ADMIN_ID))
@@ -486,6 +759,62 @@ async def search_tokens_command(client, message):
 # 📩 ADMIN'S FOLLOW-UP REPLIES
 # ==========================================
 
+async def handle_gentoken_wizard_text(client, message, user_id, action):
+    """Generate Token wizard ke 4 typed steps: files, naam, limit-value, expiry-value.
+    Baaki sab steps (limit/expiry choice, auto-delete, link, confirm) buttons se
+    handle hote hain gentoken_wizard_callback me."""
+    step = action["step"]
+    data = action["data"]
+    text = message.text.strip()
+
+    if step == "files":
+        parts = text.split()
+        file_ids, error = parse_ranges(parts)
+        if error:
+            return await message.reply_text(f"{error} — dobara bhej.")
+        if not file_ids:
+            return await message.reply_text("❌ Koi valid file ID nahi mili — dobara bhej.")
+        data["file_ids"] = file_ids
+        pending_action[user_id] = {"flow": "gentoken", "step": "name", "data": data}
+        return await message.reply_text(
+            f"✅ {len(file_ids)} file(s) mil gayi.\n\n🔑 **Step 2/6** — Token ka naam bhej:",
+            reply_markup=gtf_cancel_only_markup()
+        )
+
+    elif step == "name":
+        bits = text.split()
+        name = bits[0] if bits else ""
+        if not name:
+            return await message.reply_text("❌ Naam khali nahi ho sakta — dobara bhej.")
+        data["name"] = name
+        pending_action[user_id] = {"flow": "gentoken", "step": "limit_choice", "data": data}
+        return await message.reply_text(
+            "🔑 **Step 3/6** — Usage limit lagani hai?", reply_markup=gtf_limit_markup()
+        )
+
+    elif step == "limit_value":
+        if not text.isdigit() or int(text) <= 0:
+            return await message.reply_text("❌ Ye ek valid positive number nahi hai — dobara bhej.")
+        data["usage_limit"] = int(text)
+        pending_action[user_id] = {"flow": "gentoken", "step": "expiry_choice", "data": data}
+        return await message.reply_text(
+            f"✅ Limit set: {text} uses.\n\n🔑 **Step 4/6** — Is token ki custom expiry chahiye?",
+            reply_markup=gtf_expiry_markup()
+        )
+
+    elif step == "expiry_value":
+        seconds = parse_time(text)
+        if seconds is None:
+            return await message.reply_text("❌ Format galat hai. Use: 10m, 1h, 2d — dobara bhej.")
+        data["expiry_override_seconds"] = seconds
+        data["expiry_display"] = text
+        pending_action[user_id] = {"flow": "gentoken", "step": "autodelete_choice", "data": data}
+        return await message.reply_text(
+            f"✅ Expiry set: {text}.\n\n🔑 **Step 5/6** — Auto-delete override karna hai?",
+            reply_markup=gtf_autodelete_markup()
+        )
+
+
 @app.on_message(filters.private & filters.text & filters.user(ADMIN_ID) & ~filters.command([
     "start", "admin", "addchannel", "search"
 ]))
@@ -494,6 +823,9 @@ async def handle_admin_pending(client, message):
     action = pending_action.get(user_id)
     if not action:
         return
+
+    if isinstance(action, dict) and action.get("flow") == "gentoken":
+        return await handle_gentoken_wizard_text(client, message, user_id, action)
 
     text = message.text.strip()
 
@@ -532,96 +864,6 @@ async def handle_admin_pending(client, message):
                 return await message.reply_text("❌ Format galat hai. Use: 10m, 1h, ya `off` — dobara bhej.")
             await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": seconds}}, upsert=True)
             await message.reply_text(f"✅ Files ab {text} baad auto-delete hongi.")
-
-    elif action == "awaiting_gentoken":
-        parts = text.split()
-        if len(parts) < 2:
-            return await message.reply_text("❌ Kam se kam ek number/range aur naam chahiye — dobara bhej.")
-
-        # File-ID parts hamesha shuru me hote hain (numbers/ranges). Pehla part jo
-        # number/range nahi hai, wahi se naam+markers ka section shuru hota hai.
-        def looks_like_range_part(p):
-            if p.isdigit():
-                return True
-            bits = p.split("-")
-            return len(bits) == 2 and bits[0].isdigit() and bits[1].isdigit()
-
-        split_index = len(parts)
-        for i, p in enumerate(parts):
-            if not looks_like_range_part(p):
-                split_index = i
-                break
-
-        range_parts = parts[:split_index]
-        rest_parts = parts[split_index:]
-
-        if not range_parts:
-            return await message.reply_text("❌ Koi file ID/range nahi mila — dobara bhej.")
-        if not rest_parts:
-            return await message.reply_text("❌ Naam nahi mila — dobara bhej.")
-
-        file_ids, error = parse_ranges(range_parts)
-        if error:
-            return await message.reply_text(f"{error} — dobara bhej.")
-        if not file_ids:
-            return await message.reply_text("❌ Koi valid file ID nahi mili — dobara bhej.")
-
-        name, usage_limit, expiry_override_seconds, auto_delete_override, want_link, opt_error = parse_token_options(rest_parts)
-        if opt_error:
-            return await message.reply_text(f"{opt_error} — dobara bhej.")
-
-        config = await get_config()
-        expiry_marker = next((p for p in rest_parts if p.startswith("|E:") and p.endswith("|")), None)
-        if expiry_override_seconds is not None and expiry_marker:
-            seconds = expiry_override_seconds
-            expiry_display = expiry_marker[3:-1]
-        else:
-            expiry_display = config.get("default_timer", "1h")
-            seconds = parse_time(expiry_display) or 3600
-
-        token_id = f"Kissu-{name}"
-        await tokens_col.update_one(
-            {"token_id": token_id},
-            {"$set": {
-                "token_id": token_id,
-                "expiry_time": datetime.now() + timedelta(seconds=seconds),
-                "files": file_ids,
-                "revoked": False,
-                "usage_limit": usage_limit,
-                "used_count": 0,
-                "auto_delete_override": auto_delete_override,  # None = global setting follow karo
-            }},
-            upsert=True
-        )
-        limit_text = f"{usage_limit} uses" if usage_limit else "Unlimited"
-        if auto_delete_override is None:
-            delete_text = "Global setting follow hogi"
-        else:
-            delete_text = "ON" if auto_delete_override else "OFF"
-
-        reply_text = (
-            f"🔥 **Token Generated!**\n\n**Token:** `{token_id}`\n"
-            f"**Files:** {len(file_ids)}\n**Expires in:** {expiry_display}\n"
-            f"**Usage limit:** {limit_text}\n**Auto-delete:** {delete_text}"
-        )
-        if want_link:
-            username = await get_bot_username()
-            if username:
-                deep_link = f"https://t.me/{username}?start={token_id}"
-                reply_text += f"\n**Link:** {deep_link}"
-            else:
-                reply_text += "\n⚠️ Link nahi ban paya — bot username fetch nahi ho saka."
-
-        await message.reply_text(reply_text)
-
-
-    elif action == "awaiting_revoke":
-        token_id = text if text.startswith("Kissu-") else f"Kissu-{text}"
-        result = await tokens_col.update_one({"token_id": token_id}, {"$set": {"revoked": True}})
-        if result.matched_count == 0:
-            await message.reply_text(f"❌ Token `{token_id}` mila hi nahi.")
-        else:
-            await message.reply_text(f"✅ Token `{token_id}` revoke kar diya gaya.")
 
     elif action.startswith("awaiting_editmsg_"):
         key = action.replace("awaiting_editmsg_", "")
