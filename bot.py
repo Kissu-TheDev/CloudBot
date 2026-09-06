@@ -454,14 +454,14 @@ def gtf_summary_text(data):
 
 @app.on_message(filters.command("start") & filters.private & filters.user(ADMIN_ID))
 async def admin_start(client, message):
-    """Admin ke liye /start alag hai - seedha 👾 + panel button."""
+    """Admin ke liye /start alag hai - seedha 🔐 + panel button."""
     await users_col.update_one(
         {"_id": message.from_user.id},
         {"$set": {"_id": message.from_user.id, "first_seen": datetime.now()}},
         upsert=True
     )
     buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Open Admin Panel", callback_data="panel_open")]])
-    await message.reply_text("👾", reply_markup=buttons)
+    await message.reply_text("🔐", reply_markup=buttons)
 
 
 @app.on_message(filters.command("admin") & filters.user(ADMIN_ID))
