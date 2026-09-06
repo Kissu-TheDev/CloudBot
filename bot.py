@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant, FloodWait
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -605,11 +605,12 @@ async def handle_admin_pending(client, message):
             f"**Usage limit:** {limit_text}\n**Auto-delete:** {delete_text}"
         )
         if want_link:
-            if BOT_USERNAME:
-                deep_link = f"https://t.me/{BOT_USERNAME}?start={token_id}"
+            username = await get_bot_username()
+            if username:
+                deep_link = f"https://t.me/{username}?start={token_id}"
                 reply_text += f"\n**Link:** {deep_link}"
             else:
-                reply_text += "\n⚠️ Link nahi ban paya — bot username load nahi hua abhi tak."
+                reply_text += "\n⚠️ Link nahi ban paya — bot username fetch nahi ho saka."
 
         await message.reply_text(reply_text)
 
@@ -879,15 +880,21 @@ async def handle_token_input(client, message):
     await redeem_token(client, message, token)
 
 
-async def main():
+async def get_bot_username():
+    """BOT_USERNAME ko lazily fetch karta hai (pehli baar chahiye hone par),
+    phir cache kar leta hai — taaki har baar get_me() call na karna pade."""
     global BOT_USERNAME
-    await app.start()
-    me = await app.get_me()
-    BOT_USERNAME = me.username
-    print(f"KissuCloudBot is alive! (@{BOT_USERNAME})")
-    await idle()
-    await app.stop()
+    if BOT_USERNAME is None:
+        me = await app.get_me()
+        BOT_USERNAME = me.username
+    return BOT_USERNAME
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("KissuCloudBot is alive!")
+    # app.run() (bina argument ke) Pyrogram ka apna signal-safe start+idle+stop hai.
+    # Railway jaisi platforms restart/health-check ke liye SIGTERM bhejti rehti hain,
+    # aur manual app.start()+idle()+app.stop() pattern us signal par
+    # "attached to a different loop" RuntimeError deta hai. Plain app.run() isse
+    # sahi tarike se, Pyrogram ke apne signal handlers ke saath, handle karta hai.
+    app.run()
