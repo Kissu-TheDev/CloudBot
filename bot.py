@@ -60,7 +60,7 @@ DEFAULT_MESSAGES = {
     "welcome": {
         "hi": {
             "text": (
-                "Namaste! 🎉 KissuDrop me aapka swagat hai.\n"
+                "Namaste! 🎉 KissuCloudBot me aapka swagat hai.\n"
                 "Yahan aap apne token ke zariye files prapt kar sakte hain.\n"
                 "Bas apna token bhejein ya /start ke saath token daalein.\n"
                 "Agar koi dikkat ho, to admin se contact karein."
@@ -69,7 +69,7 @@ DEFAULT_MESSAGES = {
         },
         "en": {
             "text": (
-                "Welcome to KissuDrop.\n"
+                "Welcome to KissuCloudBot.\n"
                 "This platform enables you to retrieve files using your unique token.\n"
                 "To begin, please submit your token via the /start command followed by the token string.\n"
                 "Should you encounter any issues, kindly contact the administrator."
