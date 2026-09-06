@@ -92,8 +92,12 @@ async def is_fsub_joined(client, user_id):
         return True
     except UserNotParticipant:
         return False
-    except Exception:
-        return True  # fail-open agar bot admin nahi hai ya koi aur error
+    except Exception as e:
+        # Fail-CLOSED: koi bhi error (bot admin nahi hai, wrong channel ID, etc.)
+        # ka matlab hai "verify nahi ho paya" -> user ko not-joined treat karo.
+        # Ye zaroori hai warna ek misconfiguration se FSUB silently bypass ho jaata.
+        print(f"⚠️ FSUB check fail hua (fail-closed treat kar rahe hain): {e}")
+        return False
 
 
 async def get_message(key):
@@ -231,8 +235,19 @@ async def panel_callback(client, callback_query):
         total_tokens = await tokens_col.count_documents({})
         active_tokens = await tokens_col.count_documents({"revoked": False, "expiry_time": {"$gt": datetime.now()}})
         db_channel_id = await get_db_channel_id()
-        fsub_status = "Set ✅" if config.get("fsub_id") else "Not set ❌"
         db_status = f"`{db_channel_id}`" if db_channel_id else "Not set ❌"
+
+        fsub_id = config.get("fsub_id")
+        if not fsub_id:
+            fsub_status = "Not set ❌"
+        else:
+            # Fail-closed hone ke baad ye check zaroori hai: agar bot us channel ka
+            # admin nahi hai to FSUB "set" dikhega but practically sab users block ho rahe honge.
+            try:
+                await client.get_chat_member(int(fsub_id), "me")
+                fsub_status = f"`{fsub_id}` — ✅ Bot admin hai, working"
+            except Exception as e:
+                fsub_status = f"`{fsub_id}` — 🔴 BROKEN! Bot admin nahi hai ya access nahi ({e}). Sab users block ho rahe honge!"
 
         debug_text = (
             f"🐞 **Debug Info**\n\n"

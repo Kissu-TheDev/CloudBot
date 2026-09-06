@@ -91,7 +91,7 @@ Terminal mein `KissuCloudBot is alive!` dikhega — matlab bot chalu ho gaya.
 
 ### ⚠️ Jaani-Maani Limitations (Honest Disclosure)
 
-- **Fail-open FSUB check**: agar bot ko FSUB channel mein member-check karte waqt koi error aata hai (jaise bot us channel ka admin nahi hai), to check *pass* maan liya jaata hai — yani join-verification silently bypass ho sakta hai. Production mein use karne se pehle isko fail-closed karna better hoga.
+- **FSUB check ab fail-closed hai** ✅ (fixed): agar member-check karte waqt koi error aata hai (jaise bot us channel ka admin nahi hai), to ab user ko *not-joined* treat kiya jaata hai — bypass nahi hone diya jaata. **Trade-off:** agar bot galti se FSUB channel ka admin nahi raha, to sab users silently block ho jayenge (join-check har baar fail dikhega). Isliye `/admin` → **Debug** panel se time-time pe FSUB status check karte raho — ab wahan clearly dikhega agar bot ki permission tut gayi hai.
 - **Single admin only**: `ADMIN_ID` ek hi ID leta hai — multiple admins ka built-in support nahi hai.
 - **No rate-limiting on token guesses**: users jitni baar chahein galat token try kar sakte hain, koi cooldown/lockout nahi hai.
 - Ye actual "cloud storage" nahi hai — sab kuch Telegram ke DB channel pe depend karta hai; wo channel delete/leave hui to sab tut jaayega.
@@ -189,7 +189,7 @@ You should see `KissuCloudBot is alive!` in the terminal once it's running.
 
 ### ⚠️ Known Limitations (Honest Disclosure)
 
-- **Fail-open FSUB check**: if an error occurs while checking channel membership (e.g. the bot isn't an admin in that channel), the check silently *passes* — meaning join verification can be bypassed unintentionally. This should be made fail-closed before any production use.
+- **FSUB check is now fail-closed** ✅ (fixed): if an error occurs while checking channel membership (e.g. the bot isn't an admin in that channel), the user is now treated as *not joined* rather than silently passed through. **Trade-off:** if the bot ever loses admin rights in the FSUB channel, every user will be blocked (the join-check will fail for everyone, joined or not). Check the FSUB status in `/admin` → **Debug** periodically — it now clearly flags whether the bot's permissions are broken.
 - **Single admin only**: `ADMIN_ID` accepts a single ID — there's no built-in multi-admin support.
 - **No rate-limiting on token guesses**: users can attempt as many token strings as they want with no cooldown or lockout.
 - This is not real "cloud storage" — everything depends on the Telegram DB channel; if that channel is deleted or the bot loses access, delivery breaks.
