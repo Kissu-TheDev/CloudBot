@@ -1,8 +1,8 @@
-# KissuDrop
+# CloudBot
 
 A Telegram bot for **token-based file delivery**. Files are stored in a private Telegram channel (the "DB Channel"); the bot copies them to a user's chat only when the user presents a valid token.
 
-> KissuDrop is not a file-storage service. No file is ever uploaded to or held by the bot itself — files reside in an existing Telegram channel, and the bot's role is limited to verifying a token and copying the associated messages to the requesting user.
+> KissuCloudBot is not a file-storage service. No file is ever uploaded to or held by the bot itself — files reside in an existing Telegram channel, and the bot's role is limited to verifying a token and copying the associated messages to the requesting user.
 
 ---
 
