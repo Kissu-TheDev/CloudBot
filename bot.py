@@ -1,12 +1,18 @@
 import os
 import json
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant, FloodWait
 from motor.motor_asyncio import AsyncIOMotorClient
+
+# Pyrogram ke apne FAQ ka suggestion: agar "client started but nothing happens"
+# jaisa issue ho, INFO-level logging on karke dekho — network/socket errors
+# yahi dikhte hain jo normal print() statements catch nahi karte.
+logging.basicConfig(level=logging.INFO)
 
 # ==========================================
 # 🔧 ENV LOAD
