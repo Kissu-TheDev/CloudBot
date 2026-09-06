@@ -3,7 +3,7 @@ import json
 import asyncio
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant, FloodWait
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -40,6 +40,7 @@ users_col = db["users"]  # broadcast ke liye track karte hain kaun kaun /start k
 
 PAGE_SIZE = 10
 pending_action = {}  # { user_id: "awaiting_xxx" }
+BOT_USERNAME = None  # startup pe app.get_me() se fill hoga, deep-link banane ke liye
 
 # ==========================================
 # 💬 DEFAULT CUSTOMIZABLE MESSAGES
@@ -142,6 +143,59 @@ def parse_ranges(parts):
             return None, f"❌ `{part}` samajh nahi aaya (number ya range hona chahiye)."
     # Duplicates hata ke sorted order me rakho
     return sorted(set(file_ids)), None
+
+
+# ==========================================
+# 🏷 TOKEN OPTIONS PARSER (naam + optional markers)
+# Format: "Cutie |L:99| |E:2h| |T| ?LINK"  (order matter nahi karta markers ka)
+#  - naam: pehla plain word (koi marker match na kare)
+#  - |L:99| : usage limit (optional, default = unlimited)
+#  - |E:2h| : per-token expiry (optional, default = admin ka global default_timer)
+#  - |T| ya |F| : auto-delete override (optional, default = admin ka global setting)
+#  - ?LINK : deep-link bhi generate karo (optional, default = sirf token)
+# ==========================================
+def parse_token_options(parts):
+    """
+    parts: naam + baad ke saare tokens (jaise ["Cutie", "|L:99|", "|E:2h|", "|T|", "?LINK"])
+    Returns: (name, usage_limit, expiry_seconds, auto_delete_override, want_link, error_message_or_None)
+      expiry_seconds: int (custom) ya None (None = global default_timer follow karo)
+      auto_delete_override: True / False / None (None = global setting follow karo)
+    """
+    name = None
+    usage_limit = None
+    expiry_seconds = None
+    auto_delete_override = None
+    want_link = False
+
+    for part in parts:
+        if part == "?LINK":
+            want_link = True
+        elif part == "|T|":
+            auto_delete_override = True
+        elif part == "|F|":
+            auto_delete_override = False
+        elif part.startswith("|L:") and part.endswith("|"):
+            num_str = part[3:-1]
+            if not num_str.isdigit():
+                return None, None, None, None, False, f"❌ `{part}` me limit number nahi hai (format: `|L:99|`)."
+            usage_limit = int(num_str)
+        elif part.startswith("|E:") and part.endswith("|"):
+            time_str = part[3:-1]
+            seconds = parse_time(time_str)
+            if seconds is None:
+                return None, None, None, None, False, f"❌ `{part}` me time format galat hai (format: `|E:2h|`, `|E:30m|`, `|E:1d|`)."
+            expiry_seconds = seconds
+        elif part.startswith("|") or part.startswith("?"):
+            return None, None, None, None, False, f"❌ `{part}` samajh nahi aaya. Valid markers: `|L:number|`, `|E:time|`, `|T|`, `|F|`, `?LINK`."
+        else:
+            if name is not None:
+                return None, None, None, None, False, f"❌ Do naam mile (`{name}` aur `{part}`) — sirf ek naam allowed hai."
+            name = part
+
+    if name is None:
+        return None, None, None, None, False, "❌ Koi naam nahi mila — naam zaroori hai (files ke baad)."
+
+    return name, usage_limit, expiry_seconds, auto_delete_override, want_link, None
 
 
 # ==========================================
@@ -315,12 +369,16 @@ async def panel_callback(client, callback_query):
         "settimer": "⏱ Default token expiry time bhej (e.g. `1h`, `30m`, `1d`):",
         "autodelete": "🗑 Files kitni der baad auto-delete ho (e.g. `10m`, `1h`). Band karne ke liye `off` bhej:",
         "gentoken": (
-            "🔑 Format me bhej (ranges ya single numbers, space se separate, naam, phir optional limit):\n\n"
+            "🔑 Format me bhej (ranges/numbers, phir naam, phir optional markers — kisi bhi order me):\n\n"
             "**Single file:** `101 CuteGirl`\n"
             "**Range:** `101-112 CuteGirl`\n"
             "**Multi-range:** `4-8 20-25 VIP`\n"
-            "**Usage limit ke saath:** `4-8 20-25 VIP 50` (aakhri number = max 50 baar use hoga)\n\n"
-            "_Agar limit nahi doge to unlimited use hoga (jab tak expire na ho)._"
+            "**Usage limit ke saath:** `4-8 20-25 VIP |L:50|`\n"
+            "**Custom expiry:** `4-8 20-25 VIP |E:2h|` (`|E:30m|`, `|E:1d|` bhi chalega) — na doge to global default timer follow hoga\n"
+            "**Auto-delete override:** `4-8 20-25 VIP |T|` (ON) ya `|F|` (OFF) — na doge to global setting follow hogi\n"
+            "**Deep-link bhi chahiye:** `4-8 20-25 VIP ?LINK`\n"
+            "**Sab ek saath:** `4-8 20-25 VIP |L:50| |E:2h| |T| ?LINK`\n\n"
+            "_Limit na do to unlimited use hoga. Marker order matter nahi karta._"
         ),
         "revoke": "❌ Jo token revoke karna hai uska naam bhej (e.g. `Kissu-CuteGirl`):",
     }
@@ -474,15 +532,27 @@ async def handle_admin_pending(client, message):
         if len(parts) < 2:
             return await message.reply_text("❌ Kam se kam ek number/range aur naam chahiye — dobara bhej.")
 
-        usage_limit = None
-        # Agar aakhri part pure number hai, wo usage limit hai (naam kabhi pura number nahi hota)
-        if parts[-1].isdigit() and len(parts) >= 3:
-            usage_limit = int(parts[-1])
-            name = parts[-2]
-            range_parts = parts[:-2]
-        else:
-            name = parts[-1]
-            range_parts = parts[:-1]
+        # File-ID parts hamesha shuru me hote hain (numbers/ranges). Pehla part jo
+        # number/range nahi hai, wahi se naam+markers ka section shuru hota hai.
+        def looks_like_range_part(p):
+            if p.isdigit():
+                return True
+            bits = p.split("-")
+            return len(bits) == 2 and bits[0].isdigit() and bits[1].isdigit()
+
+        split_index = len(parts)
+        for i, p in enumerate(parts):
+            if not looks_like_range_part(p):
+                split_index = i
+                break
+
+        range_parts = parts[:split_index]
+        rest_parts = parts[split_index:]
+
+        if not range_parts:
+            return await message.reply_text("❌ Koi file ID/range nahi mila — dobara bhej.")
+        if not rest_parts:
+            return await message.reply_text("❌ Naam nahi mila — dobara bhej.")
 
         file_ids, error = parse_ranges(range_parts)
         if error:
@@ -490,9 +560,18 @@ async def handle_admin_pending(client, message):
         if not file_ids:
             return await message.reply_text("❌ Koi valid file ID nahi mili — dobara bhej.")
 
+        name, usage_limit, expiry_override_seconds, auto_delete_override, want_link, opt_error = parse_token_options(rest_parts)
+        if opt_error:
+            return await message.reply_text(f"{opt_error} — dobara bhej.")
+
         config = await get_config()
-        expiry_str = config.get("default_timer", "1h")
-        seconds = parse_time(expiry_str) or 3600
+        expiry_marker = next((p for p in rest_parts if p.startswith("|E:") and p.endswith("|")), None)
+        if expiry_override_seconds is not None and expiry_marker:
+            seconds = expiry_override_seconds
+            expiry_display = expiry_marker[3:-1]
+        else:
+            expiry_display = config.get("default_timer", "1h")
+            seconds = parse_time(expiry_display) or 3600
 
         token_id = f"Kissu-{name}"
         await tokens_col.update_one(
@@ -504,14 +583,30 @@ async def handle_admin_pending(client, message):
                 "revoked": False,
                 "usage_limit": usage_limit,
                 "used_count": 0,
+                "auto_delete_override": auto_delete_override,  # None = global setting follow karo
             }},
             upsert=True
         )
         limit_text = f"{usage_limit} uses" if usage_limit else "Unlimited"
-        await message.reply_text(
+        if auto_delete_override is None:
+            delete_text = "Global setting follow hogi"
+        else:
+            delete_text = "ON" if auto_delete_override else "OFF"
+
+        reply_text = (
             f"🔥 **Token Generated!**\n\n**Token:** `{token_id}`\n"
-            f"**Files:** {len(file_ids)}\n**Expires in:** {expiry_str}\n**Usage limit:** {limit_text}"
+            f"**Files:** {len(file_ids)}\n**Expires in:** {expiry_display}\n"
+            f"**Usage limit:** {limit_text}\n**Auto-delete:** {delete_text}"
         )
+        if want_link:
+            if BOT_USERNAME:
+                deep_link = f"https://t.me/{BOT_USERNAME}?start={token_id}"
+                reply_text += f"\n**Link:** {deep_link}"
+            else:
+                reply_text += "\n⚠️ Link nahi ban paya — bot username load nahi hua abhi tak."
+
+        await message.reply_text(reply_text)
+
 
     elif action == "awaiting_revoke":
         token_id = text if text.startswith("Kissu-") else f"Kissu-{text}"
@@ -626,7 +721,18 @@ async def send_batch(client, chat_id, token_data, offset):
 
     config = await get_config()
     protect = config.get("content_protection", False)
-    auto_delete_seconds = config.get("auto_delete_seconds", 0)
+    global_auto_delete_seconds = config.get("auto_delete_seconds", 0)
+
+    # Per-token override: True = force ON, False = force OFF, None = global setting follow karo
+    override = token_data.get("auto_delete_override")
+    if override is False:
+        auto_delete_seconds = 0
+    elif override is True:
+        # Global seconds agar 0/band hai to bhi |T| ka matlab kuch hona chahiye —
+        # isliye global value use karo agar set hai, warna 1 hour default fallback.
+        auto_delete_seconds = global_auto_delete_seconds if global_auto_delete_seconds > 0 else 3600
+    else:
+        auto_delete_seconds = global_auto_delete_seconds
 
     all_files = token_data["files"]
     batch = all_files[offset: offset + PAGE_SIZE]
@@ -690,43 +796,9 @@ async def next_batch_callback(client, callback_query):
 # 🚀 USER FLOW (non-admin): /start -> welcome + Join/Verify -> verified -> token -> sending
 # ==========================================
 
-@app.on_message(filters.command("start") & filters.private & ~filters.user(ADMIN_ID))
-async def user_start(client, message):
-    await users_col.update_one(
-        {"_id": message.from_user.id},
-        {"$set": {"_id": message.from_user.id, "first_seen": datetime.now()}},
-        upsert=True
-    )
-    config = await get_config()
-    fsub_link = config.get("fsub_link")
-
-    if fsub_link and not await is_fsub_joined(client, message.from_user.id):
-        buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
-            [InlineKeyboardButton("✅ Verify", callback_data="verify_fsub")],
-        ])
-        return await send_custom(client, message.chat.id, "welcome", reply_markup=buttons)
-
-    await send_custom(client, message.chat.id, "verified")
-
-
-@app.on_callback_query(filters.regex(r"^verify_fsub$"))
-async def verify_fsub_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    if await is_fsub_joined(client, user_id):
-        await callback_query.answer("✅ Verified!")
-        msg_data = await get_message("verified")
-        await callback_query.message.edit_text(msg_data["text"])
-        for extra_text in msg_data.get("extra", []):
-            await client.send_message(callback_query.message.chat.id, extra_text)
-    else:
-        await callback_query.answer("❌ Abhi bhi join nahi kiya hai. Pehle join kar.", show_alert=True)
-
-
-@app.on_message(filters.private & filters.text & filters.regex(r"^Kissu-") & ~filters.user(ADMIN_ID))
-async def handle_token_input(client, message):
+async def redeem_token(client, message, token):
+    """Token check + file delivery — plain-text token aur deep-link (/start token) dono se call hota hai."""
     user_id = message.from_user.id
-    token = message.text.strip()
 
     if not await is_fsub_joined(client, user_id):
         config = await get_config()
@@ -755,6 +827,61 @@ async def handle_token_input(client, message):
     await send_batch(client, message.chat.id, token_data, offset=0)
 
 
+@app.on_message(filters.command("start") & filters.private & ~filters.user(ADMIN_ID))
+async def user_start(client, message):
+    await users_col.update_one(
+        {"_id": message.from_user.id},
+        {"$set": {"_id": message.from_user.id, "first_seen": datetime.now()}},
+        upsert=True
+    )
+
+    # Deep-link se aaya hai to /start ke saath token bhi hoga: /start Kissu-Cutie
+    if len(message.command) > 1:
+        token = message.command[1].strip()
+        if token.startswith("Kissu-"):
+            return await redeem_token(client, message, token)
+
+    config = await get_config()
+    fsub_link = config.get("fsub_link")
+
+    if fsub_link and not await is_fsub_joined(client, message.from_user.id):
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
+            [InlineKeyboardButton("✅ Verify", callback_data="verify_fsub")],
+        ])
+        return await send_custom(client, message.chat.id, "welcome", reply_markup=buttons)
+
+    await send_custom(client, message.chat.id, "verified")
+
+
+@app.on_callback_query(filters.regex(r"^verify_fsub$"))
+async def verify_fsub_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    if await is_fsub_joined(client, user_id):
+        await callback_query.answer("✅ Verified!")
+        msg_data = await get_message("verified")
+        await callback_query.message.edit_text(msg_data["text"])
+        for extra_text in msg_data.get("extra", []):
+            await client.send_message(callback_query.message.chat.id, extra_text)
+    else:
+        await callback_query.answer("❌ Abhi bhi join nahi kiya hai. Pehle join kar.", show_alert=True)
+
+
+@app.on_message(filters.private & filters.text & filters.regex(r"^Kissu-") & ~filters.user(ADMIN_ID))
+async def handle_token_input(client, message):
+    token = message.text.strip()
+    await redeem_token(client, message, token)
+
+
+async def main():
+    global BOT_USERNAME
+    await app.start()
+    me = await app.get_me()
+    BOT_USERNAME = me.username
+    print(f"KissuCloudBot is alive! (@{BOT_USERNAME})")
+    await idle()
+    await app.stop()
+
+
 if __name__ == "__main__":
-    print("KissuCloudBot is alive!")
-    app.run()
+    asyncio.run(main())

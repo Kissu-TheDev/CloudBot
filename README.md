@@ -1,8 +1,8 @@
-# 🧑‍💻 KissuCloudBot (CLOUD)
+# 🧑‍💻 KissuDrop
 
-Ek Telegram bot jo **token-based file delivery** karta hai — ek private DB channel se files ko token ke through users tak bhejta hai, saath mein force-subscribe, auto-delete, aur ek full admin panel ke saath.
+Ek Telegram bot jo **token-based file delivery** karta hai — ek private DB channel se files ko token ke through users tak bhejta hai, saath mein force-subscribe, auto-delete, per-token expiry, aur ek full admin panel ke saath.
 
-> ⚠️ **Naam se dhoka mat khana:** ye "cloud storage" nahi hai. Ye ek **file-forwarding / token-gated distribution bot** hai. Files actually kahin upload nahi hoti bot ke through — wo pehle se ek Telegram channel (DB Channel) mein padi hoti hain, bot sirf token ke basis pe unhe copy karke bhejta hai.
+> 📦 Naam **KissuDrop** isliye rakha gaya hai kyunki bot exactly yahi karta hai — token ke through files "drop" karta hai users tak. Ye actual "cloud storage" nahi hai: files kahin upload nahi hoti bot ke through, wo pehle se ek Telegram channel (DB Channel) mein padi hoti hain, bot sirf token ke basis pe unhe copy karke bhejta hai.
 
 ---
 
@@ -45,8 +45,8 @@ Ek Telegram bot jo **token-based file delivery** karta hai — ek private DB cha
 
 **1. Repo clone karo**
 ```bash
-git clone https://github.com/456IND/CLOUD.git
-cd CLOUD
+git clone https://github.com/Kissu-TheDev/KissuDrop.git
+cd KissuDrop
 ```
 
 **2. Dependencies install karo**
@@ -84,7 +84,15 @@ Terminal mein `KissuCloudBot is alive!` dikhega — matlab bot chalu ho gaya.
 3. `/admin` se panel kabhi bhi khol sakte ho. Panel se:
    - **Set DB Channel** — jahan se files copy hongi.
    - **Set FSUB** — force-join channel ID + link.
-   - **Generate Token** — format: `101-112 CuteGirl` (range + naam), optional last number = usage limit.
+   - **Generate Token** — format: `<ranges/files> <naam> [|L:limit|] [|E:time|] [|T| ya |F|] [?LINK]`
+     - `01-19 21-25 Cutie` → sirf token banega, unlimited use, global default timer + global auto-delete setting follow hogi
+     - `01-19 21-25 Cutie |L:99|` → 99 baar tak use ho sakta hai
+     - `01-19 21-25 Cutie |E:2h|` → is token ki apni custom expiry (2 ghante), global default timer ignore
+     - `01-19 21-25 Cutie |T|` → is token ki files ke liye auto-delete force ON (global setting ignore)
+     - `01-19 21-25 Cutie |F|` → is token ki files auto-delete kabhi nahi hongi (global setting ignore)
+     - `01-19 21-25 Cutie ?LINK` → token ke saath ek Telegram deep-link bhi milega jisse user click karke seedha bot mein token redeem kar sakta hai
+     - Sab ek saath, kisi bhi order mein: `01-19 21-25 Cutie |L:99| |E:2h| |T| ?LINK`
+     - Marker na do to us cheez ka default lagta hai: limit = unlimited, expiry = global default timer, auto-delete = global setting, link = nahi milega
    - **Set Timer** — token kitni der mein expire hoga (`1h`, `30m`, `1d`).
    - **Auto-Delete** — sent files kitni der baad delete ho.
 4. Generated token (`Kissu-CuteGirl`) user ko manually bhejo — bot khud shareable link nahi banata, token hi share karna padta hai.
@@ -98,7 +106,7 @@ Terminal mein `KissuCloudBot is alive!` dikhega — matlab bot chalu ho gaya.
 
 ### Folder Structure
 ```
-CLOUD/
+KissuDrop/
 ├── bot.py            # Poora bot logic (single file)
 ├── requirements.txt  # Python dependencies
 └── .env.example      # Config template
@@ -145,8 +153,8 @@ CLOUD/
 
 **1. Clone the repo**
 ```bash
-git clone https://github.com/456IND/CLOUD.git
-cd CLOUD
+git clone https://github.com/Kissu-TheDev/KissuDrop.git
+cd KissuDrop
 ```
 
 **2. Install dependencies**
@@ -182,7 +190,15 @@ You should see `KissuCloudBot is alive!` in the terminal once it's running.
 3. Open the panel anytime with `/admin`. From there you can:
    - **Set DB Channel** — the source channel files are copied from.
    - **Set FSUB** — the force-join channel ID + invite link.
-   - **Generate Token** — format: `101-112 CuteGirl` (range + name), with an optional trailing number as the usage limit.
+   - **Generate Token** — format: `<ranges/files> <name> [|L:limit|] [|E:time|] [|T| or |F|] [?LINK]`
+     - `01-19 21-25 Cutie` → generates just the token, unlimited uses, follows the global default timer and global auto-delete setting
+     - `01-19 21-25 Cutie |L:99|` → limits the token to 99 redemptions
+     - `01-19 21-25 Cutie |E:2h|` → gives this token its own custom expiry (2 hours), overriding the global default timer
+     - `01-19 21-25 Cutie |T|` → forces auto-delete ON for this token's files (overrides the global setting)
+     - `01-19 21-25 Cutie |F|` → forces auto-delete OFF for this token's files (overrides the global setting)
+     - `01-19 21-25 Cutie ?LINK` → also returns a Telegram deep-link the user can click to redeem the token directly
+     - All together, in any order: `01-19 21-25 Cutie |L:99| |E:2h| |T| ?LINK`
+     - Omitting a marker uses its default: limit = unlimited, expiry = global default timer, auto-delete = follows global setting, link = not generated
    - **Set Timer** — how long before a token expires (`1h`, `30m`, `1d`).
    - **Auto-Delete** — how long after delivery files should be removed.
 4. Share the generated token (`Kissu-CuteGirl`) with the user manually — the bot does not generate a shareable link itself.
@@ -196,7 +212,7 @@ You should see `KissuCloudBot is alive!` in the terminal once it's running.
 
 ### Folder Structure
 ```
-CLOUD/
+KissuDrop/
 ├── bot.py            # Full bot logic (single file)
 ├── requirements.txt  # Python dependencies
 └── .env.example      # Config template
