@@ -64,7 +64,7 @@ DEFAULT_MESSAGES = {
     "welcome": {"text": "🧑‍💻", "extra": []},
     "verified": {"text": "🪪", "extra": []},
     "not_joined": {"text": "🗝️", "extra": []},
-    "restricted": {"text": "🚫", "extra": []},
+    "restricted": {"text": "❗️", "extra": []},
     "admin_welcome": {"text": "✅", "extra": []},
     "sending": {"text": "📤", "extra": []},
     "invalid_token": {"text": "❌", "extra": []},
