@@ -25,7 +25,8 @@ Ek Telegram bot jo **token-based file delivery** karta hai — ek private DB cha
 - **Force Subscribe (FSUB)** — file delivery channel-join se conditional hai. Membership check **fail-closed** hai: agar check ke dauraan koi error aaye (jaise bot ka us channel mein admin access na hona), to user ko *not-joined* treat kiya jaata hai — koi accidental bypass nahi hota. Trade-off: agar bot kabhi FSUB channel ka admin nahi raha, sab users block ho jaayenge — isliye `/admin` → Debug se status check karte rehna zaroori hai.
 - **Rate-Limiting** 🤖 — agar koi user ek chhoti time-window ke andar bahut baar token redeem kare, to usko ek **fixed cooldown** ke liye rok diya jaata hai — jab tak wo exact time khatam na ho jaaye, sliding-window naya check nahi hota (spam karne se cooldown reset nahi hoga). Cooldown-message ab do alag messages mein aata hai: ek editable `🤖` (Edit Messages se) + ek exact-countdown text. Count, window, cooldown-time — sab `/admin` se customize ho sakte hain.
 - **Multiple Admins** — `.env` wala `ADMIN_ID` **super-admin** hai; wahi doosre admins ko add/remove kar sakta hai (`/admin` → Manage Admins). Extra admins ko poora panel access milta hai, sirf Manage Admins unhe nahi dikhta.
-- **Ban System** — kisi bhi user ko user-ID se ban kiya ja sakta hai (`/admin` → Ban/Unban User). Ban hote hi, agar wo FSUB channel ka member hai, use turant kick bhi kar diya jaata hai. Banned user ke liye bot silently non-responsive ho jaata hai (`/start`, token-redeem, sab). Poori banned-list JSON file ke roop mein export ho sakti hai.
+- **Ban System** — kisi bhi user ko user-ID se ban kiya ja sakta hai (`/admin` → Ban/Unban User). Ban hote hi, agar wo FSUB channel ka member hai, use turant kick bhi kar diya jaata hai. Banned user ke liye bot silently non-responsive ho jaata hai (`/start`, token-redeem, sab). Poori banned-list JSON file ke roop mein export ho sakti hai. Admins (super ya extra) kabhi ban nahi ho sakte — pehle unhe Manage Admins se hataana padega.
+- **Suspicious-Activity Auto-Alert** — agar koi user rate-limit ko **lagatar 5 baar** trigger kare (matlab beech mein koi successful redeem nahi), sabhi admins ko turant ek DM alert milta hai, user ki ID + naam + username ke saath, aur ek **"🚫 Ban This User"** button — ek-click ban, ID manually dhundhne/type karne ki zaroorat nahi.
 - **Content Protection** — Telegram ke `protect_content` flag se forward/save optionally block ho sakta hai.
 - **Customizable Messages** — welcome, verified, not-joined, restricted, admin-welcome, sending, invalid-token, rate-limit emoji, banned — sab default mein sirf ek emoji hain, lekin admin panel se chaho to inme extra text/messages add kiye ja sakte hain.
 - **Broadcast** — sabhi users ko, ya specific channels ko ek saath message bhejne ki facility.
@@ -146,12 +147,19 @@ Terminal mein `KissuCloudBot is alive!` dikhega — bot chalu ho gaya.
 2. Apne account se `/start` karo → seedha admin panel ka button milega.
 3. `/admin` se panel kabhi bhi khol sakte ho.
 
+**ID nikalna** (`/getid`) — kisi user, group, ya channel ki ID chahiye ho to:
+- Us user/group/channel ka koi message bot ko **forward** karo, phir `/getid` bhejo.
+- Ya kisi message pe seedha **reply** karke `/getid` bhejo (uske sender ki ID mil jaayegi).
+- Group-message forward karne pe, sender-ID **aur** group-ID dono milte hain (agar available ho).
+- ⚠️ Agar sender ne apni Telegram privacy settings me "forwarded messages me naam chhupao" on kar rakha hai, uski ID nahi mil paayegi — ye Telegram ka restriction hai, bot ka nahi.
+
 ## Jaani-Maani Limitations (Honest Disclosure)
 
 - **FSUB fail-closed hai** — agar bot kabhi FSUB channel ka admin nahi raha, sab users block ho jaayenge. `/admin` → Debug se check karte raho.
 - **Rate-limit aur ban-check in-memory + DB mix hai** — cooldown timers in-memory hain (bot restart hote hi active cooldowns clear ho jaayenge, harmless hai), lekin bans aur admin-list MongoDB mein persist hote hain.
 - **Wizard state in-memory hai** — agar bot Generate Token wizard ke beech restart ho jaaye, wo progress discard ho jaata hai.
 - **Token `used_count` mein ek chhota race-condition window hai** — agar ek hi token ko do requests **exact same moment** pe redeem karein, usage-limit ka enforcement thoda loose ho sakta hai (atomic `$inc` hai, lekin limit-check aur increment ke beech gap hai). High-traffic single-token scenarios mein iska dhyan rakhna.
+- **`/getid` Telegram ki privacy settings pe depend karta hai** — agar sender ne forward-attribution hide kar rakha ho, uski ID kabhi nahi milegi, chahe kuch bhi try karo.
 - Ye asli "cloud storage" nahi hai — sab kuch Telegram ke DB channel pe depend karta hai.
 
 ## Folder Structure

@@ -52,6 +52,8 @@ pending_action = {}  # { user_id: "awaiting_xxx" }
 BOT_USERNAME = None  # startup pe app.get_me() se fill hoga, deep-link banane ke liye
 redemption_times = {}  # { user_id: [timestamp1, timestamp2, ...] } — rate-limit sliding window ke liye
 rate_limit_blocks = {}  # { user_id: blocked_until_timestamp } — fixed hard-cooldown ke liye
+CONSECUTIVE_HIT_ALERT_THRESHOLD = 5  # itni consecutive baar cooldown lagne pe admin-alert bhejo
+rate_limit_hit_counts = {}  # { user_id: consecutive_count } — successful redeem pe reset hota hai
 _admin_ids_cache = None  # set of admin ids, lazily filled + invalidated on add/remove
 _config_cache = None  # (config_dict, fetched_at_timestamp) — chhota TTL cache taaki har handler baar-baar DB na maare
 _CONFIG_CACHE_TTL = 5  # seconds
@@ -1053,6 +1055,54 @@ async def add_broadcast_channel(client, message):
     await message.reply_text(f"✅ Channel add ho gaya. Total: {len(channels)}\n\n⚠️ Bot ko us channel me admin banana mat bhoolna.")
 
 
+@app.on_message(filters.command("getid") & admin_filter)
+async def get_id_command(client, message):
+    """Kisi bhi user/group/channel ki ID nikalne ke liye — ek message forward karo
+    ya kisi message pe reply karke /getid bhejo, ID mil jaayegi.
+
+    Limitation: agar sender ne "forwarded messages me naam chhupao" privacy setting
+    on kar rakhi hai, to forward_from empty aayega — ye Telegram ki restriction hai,
+    iska koi workaround nahi hai."""
+    target = message.reply_to_message
+    if not target:
+        return await message.reply_text(
+            "ℹ️ Kisi message ko **forward** karke, ya kisi message pe **reply** karke `/getid` bhej.\n\n"
+            "⚠️ Agar sender ne privacy setting me forward-attribution off kar rakha hai, "
+            "uski ID nahi mil paayegi — ye Telegram ka restriction hai."
+        )
+
+    lines = []
+
+    # Case 1: Directly kisi user ka message forward hua hai
+    if target.forward_from:
+        u = target.forward_from
+        uname = f"@{u.username}" if u.username else "(no username)"
+        lines.append(f"👤 **User:** {u.first_name} {uname}\n**ID:** `{u.id}`")
+
+    # Case 2: Group/Channel se forward hua hai (post, ya kisi member ka group-message)
+    if target.forward_from_chat:
+        c = target.forward_from_chat
+        cname = f"@{c.username}" if c.username else "(no username)"
+        chat_type = str(c.type).split(".")[-1].title()
+        lines.append(f"💬 **{chat_type}:** {c.title} {cname}\n**ID:** `{c.id}`")
+        # Group-message ke case me sender-signature milta hai agar available ho
+        if target.forward_sender_name and not target.forward_from:
+            lines.append(f"(Sender ka naam mila but ID nahi — privacy setting on hai: {target.forward_sender_name})")
+
+    # Case 3: Forward nahi hai, seedha reply hai — us message ke sender ki ID de do
+    if not target.forward_from and not target.forward_from_chat and target.from_user:
+        u = target.from_user
+        uname = f"@{u.username}" if u.username else "(no username)"
+        lines.append(f"👤 **User (reply se):** {u.first_name} {uname}\n**ID:** `{u.id}`")
+
+    if not lines:
+        return await message.reply_text(
+            "❌ ID nahi mil payi. Sender ne shayad privacy setting me forward-attribution off kar rakha hai."
+        )
+
+    await message.reply_text("\n\n".join(lines))
+
+
 @app.on_message(filters.command("search") & admin_filter)
 async def search_tokens_command(client, message):
     now = datetime.now()
@@ -1135,7 +1185,7 @@ async def handle_gentoken_wizard_text(client, message, user_id, action):
 
 
 @app.on_message(filters.private & filters.text & admin_filter & ~filters.command([
-    "start", "admin", "addchannel", "search"
+    "start", "admin", "addchannel", "search", "getid"
 ]))
 async def handle_admin_pending(client, message):
     user_id = message.from_user.id
@@ -1294,6 +1344,8 @@ async def handle_admin_pending(client, message):
             target_id = int(parts[0])
         except (ValueError, IndexError):
             return await message.reply_text("❌ Valid user ID bhej (number). Optional reason space ke baad: `123456 spam kar raha`")
+        if await is_admin_user(target_id):
+            return await message.reply_text("❌ Ye ID kisi admin (super-admin ya extra admin) ki hai — ban nahi kar sakta. Pehle Manage Admins se hataana padega.")
         reason = parts[1] if len(parts) > 1 else None
         await banned_col.update_one(
             {"_id": target_id},
@@ -1332,7 +1384,11 @@ async def handle_admin_pending(client, message):
             return await message.reply_text("❌ Valid user ID bhej (number) — dobara try kar.")
         await admins_col.update_one({"_id": target_id}, {"$set": {"_id": target_id}}, upsert=True)
         invalidate_admin_cache()
-        await message.reply_text(f"👑 User `{target_id}` ab admin hai.")
+        unban_note = ""
+        if await banned_col.find_one({"_id": target_id}):
+            await banned_col.delete_one({"_id": target_id})
+            unban_note = " (Ye pehle se banned tha, ab unban bhi kar diya.)"
+        await message.reply_text(f"👑 User `{target_id}` ab admin hai.{unban_note}")
 
     elif action == "awaiting_adm_remove":
         if user_id != ADMIN_ID:
@@ -1440,6 +1496,44 @@ async def next_batch_callback(client, callback_query):
     await send_batch(client, callback_query.message.chat.id, token_data, offset=offset)
 
 
+@app.on_callback_query(filters.regex(r"^quickban_") & admin_filter)
+async def quickban_callback(client, callback_query):
+    """Suspicious-activity alert ke 'Ban This User' button se aata hai — koi bhi
+    admin dabaye to ban ho jaata hai, ID manually type karne ki zaroorat nahi."""
+    payload = callback_query.data.split("_", 1)[1]
+
+    if payload == "ignore":
+        await callback_query.answer("OK, ignore kar diya.")
+        return await callback_query.message.edit_text(callback_query.message.text + "\n\n_Ignored._")
+
+    target_id = int(payload)
+
+    if await is_admin_user(target_id):
+        await callback_query.answer("❌ Ye admin hai, ban nahi ho sakta.", show_alert=True)
+        return await callback_query.message.edit_text(
+            callback_query.message.text + "\n\n_Ban failed — ye ID admin hai._"
+        )
+
+    await banned_col.update_one(
+        {"_id": target_id},
+        {"$set": {"banned_at": datetime.now(), "reason": "Auto-flagged: repeated rate-limit hits"}},
+        upsert=True
+    )
+    config = await get_config()
+    fsub_id = config.get("fsub_id")
+    kicked_note = ""
+    if fsub_id:
+        try:
+            await client.ban_chat_member(int(fsub_id), target_id)
+            kicked_note = " Aur FSUB channel se bhi kick kar diya."
+        except Exception:
+            kicked_note = " (FSUB se kick nahi ho paya.)"
+    await callback_query.answer("🚫 Ban ho gaya.")
+    await callback_query.message.edit_text(
+        callback_query.message.text + f"\n\n✅ **Ban ho gaya.**{kicked_note}"
+    )
+
+
 # ==========================================
 # 🚀 USER FLOW (non-admin): /start -> welcome + Join/Verify -> verified -> token -> sending
 # ==========================================
@@ -1454,8 +1548,9 @@ async def check_rate_limit(user_id):
     turant baad hi dobara burst allowed ho jaata tha. Ab har attempt (block ho ya
     na ho) record hoti hai, taaki cooldown ke dauraan spam se limit reset na ho.
 
-    Returns (is_blocked: bool, wait_seconds: int) — jab blocked hai to wait_seconds
-    hamesha exact remaining time hai, kabhi bhi fixed config value nahi.
+    Returns (is_blocked, wait_seconds, hit_alert) — hit_alert True hoti hai jab
+    user consecutively CONSECUTIVE_HIT_ALERT_THRESHOLD baar naya cooldown lagwa
+    chuka ho (matlab genuinely spam kar raha hai, koi random ek-do baar ka hit nahi).
     """
     now = datetime.now().timestamp()
 
@@ -1463,7 +1558,7 @@ async def check_rate_limit(user_id):
     # cooldown ke dauran attempts count karna faltu hai, blocked_until hi authority hai.
     blocked_until = rate_limit_blocks.get(user_id)
     if blocked_until and now < blocked_until:
-        return True, int(blocked_until - now) + 1
+        return True, int(blocked_until - now) + 1, False
 
     config = await get_config()
     count_limit = config.get("ratelimit_count", DEFAULT_RATELIMIT_COUNT)
@@ -1479,9 +1574,38 @@ async def check_rate_limit(user_id):
         # Limit cross hui — ab fixed hard-cooldown lagao. Jab tak ye khatam na ho,
         # sliding window dobara check nahi hogi (upar wala early-return isko handle karta hai).
         rate_limit_blocks[user_id] = now + wait_seconds
-        return True, wait_seconds
+        hit_count = rate_limit_hit_counts.get(user_id, 0) + 1
+        rate_limit_hit_counts[user_id] = hit_count
+        hit_alert = hit_count >= CONSECUTIVE_HIT_ALERT_THRESHOLD
+        if hit_alert:
+            rate_limit_hit_counts[user_id] = 0  # alert bhej diya, counter reset karo taaki spam-alert na aaye
+        return True, wait_seconds, hit_alert
 
-    return False, wait_seconds
+    return False, wait_seconds, False
+
+
+async def notify_admins_suspicious(client, user_id, from_user):
+    """Consecutive rate-limit hits threshold cross hone pe sabhi admins ko DM karta hai,
+    ek 'Ban This User' button ke saath — taaki admin ko ID copy-paste karne ki
+    zaroorat na pade, seedha button se ban ho jaaye."""
+    name = from_user.first_name or "Unknown"
+    username_line = f"@{from_user.username}" if from_user.username else "(no username)"
+    text = (
+        f"⚠️ **Suspicious Activity**\n\n"
+        f"User `{user_id}` ({name}, {username_line}) ne rate-limit lagatar "
+        f"{CONSECUTIVE_HIT_ALERT_THRESHOLD} baar trigger kiya hai — spam ho sakta hai.\n\n"
+        f"Ban karna hai?"
+    )
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Ban This User", callback_data=f"quickban_{user_id}")],
+        [InlineKeyboardButton("Ignore", callback_data="quickban_ignore")],
+    ])
+    admin_ids = await get_all_admin_ids()
+    for admin_id in admin_ids:
+        try:
+            await client.send_message(admin_id, text, reply_markup=buttons)
+        except Exception:
+            pass  # Admin ne bot ko kabhi /start nahi kiya, ya block kar rakha hai — skip karo.
 
 
 async def redeem_token(client, message, token):
@@ -1491,14 +1615,17 @@ async def redeem_token(client, message, token):
     if await is_banned(user_id):
         return  # Banned user ko silently ignore karo — koi feedback nahi ki bot exist karta hai.
 
-    is_limited, wait_seconds = await check_rate_limit(user_id)
+    is_limited, wait_seconds, hit_alert = await check_rate_limit(user_id)
     if is_limited:
         config = await get_config()
         emoji_msg = await get_message("ratelimit")  # editable "🤖" — admin panel se change ho sakta hai
         wait_template = config.get("ratelimit_message", DEFAULT_RATELIMIT_MESSAGE)
         wait_text = wait_template.replace("{s}", str(wait_seconds))
         await message.reply_text(emoji_msg["text"])
-        return await message.reply_text(wait_text)
+        await message.reply_text(wait_text)
+        if hit_alert:
+            asyncio.create_task(notify_admins_suspicious(client, user_id, message.from_user))
+        return
 
     if not await is_fsub_joined(client, user_id):
         config = await get_config()
@@ -1521,6 +1648,7 @@ async def redeem_token(client, message, token):
     if usage_limit is not None and used_count >= usage_limit:
         return await message.reply_text("❌")
 
+    rate_limit_hit_counts[user_id] = 0  # successful redeem — consecutive-hit streak toot gayi
     await tokens_col.update_one({"token_id": token}, {"$inc": {"used_count": 1}})
 
     await send_custom(client, message.chat.id, "sending")
