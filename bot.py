@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import asyncio
 import logging
@@ -34,7 +35,7 @@ if missing:
     raise SystemExit(f"❌ .env me ye missing hai: {', '.join(missing)}")
 
 API_ID = int(API_ID)
-ADMIN_ID = int(ADMIN_ID)
+ADMIN_ID = int(ADMIN_ID)  # Super-admin — sirf ye doosre admins add/remove kar sakta hai, .env se aata hai
 
 app = Client("KissuCloudBot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
@@ -43,11 +44,17 @@ db = db_client["KissuDB"]
 settings_col = db["settings"]
 tokens_col = db["tokens"]
 users_col = db["users"]  # broadcast ke liye track karte hain kaun kaun /start kar chuka hai
+admins_col = db["admins"]  # super-admin ke alawa jo extra admins add kiye gaye hain: { _id: user_id }
+banned_col = db["banned_users"]  # { _id: user_id, banned_at: datetime, reason: str|None }
 
 PAGE_SIZE = 10
 pending_action = {}  # { user_id: "awaiting_xxx" }
 BOT_USERNAME = None  # startup pe app.get_me() se fill hoga, deep-link banane ke liye
-redemption_times = {}  # { user_id: [timestamp1, timestamp2, ...] } — rate-limit ke liye recent redemption history
+redemption_times = {}  # { user_id: [timestamp1, timestamp2, ...] } — rate-limit sliding window ke liye
+rate_limit_blocks = {}  # { user_id: blocked_until_timestamp } — fixed hard-cooldown ke liye
+_admin_ids_cache = None  # set of admin ids, lazily filled + invalidated on add/remove
+_config_cache = None  # (config_dict, fetched_at_timestamp) — chhota TTL cache taaki har handler baar-baar DB na maare
+_CONFIG_CACHE_TTL = 5  # seconds
 
 # Rate-limit defaults — sab kuch /admin se customize ho sakta hai (config me store hote hain)
 DEFAULT_RATELIMIT_COUNT = 3        # kitni baar redeem karne ke baad cooldown lage
@@ -68,6 +75,8 @@ DEFAULT_MESSAGES = {
     "admin_welcome": {"text": "✅", "extra": []},
     "sending": {"text": "📤", "extra": []},
     "invalid_token": {"text": "❌", "extra": []},
+    "ratelimit": {"text": "🤖", "extra": []},
+    "banned": {"text": "🚫", "extra": []},
 }
 
 
@@ -86,7 +95,80 @@ def parse_time(time_str):
 
 
 async def get_config():
-    return await settings_col.find_one({"_id": "config"}) or {}
+    """5-second TTL cache ke saath — pehle almost har handler apne se config fetch
+    kar raha tha, kabhi ek hi request ke andar 2-3 baar. Isse Mongo round-trips
+    kaafi kam ho jaate hain, aur settings change hote hi max 5s me naya reflect ho jaata."""
+    global _config_cache
+    now = datetime.now().timestamp()
+    if _config_cache is not None and (now - _config_cache[1]) < _CONFIG_CACHE_TTL:
+        return _config_cache[0]
+    config = await settings_col.find_one({"_id": "config"}) or {}
+    _config_cache = (config, now)
+    return config
+
+
+def invalidate_config_cache():
+    """Jab bhi settings_col me koi write ho, isko call karo taaki agla read stale na mile."""
+    global _config_cache
+    _config_cache = None
+
+
+async def set_config(fields):
+    """settings_col.update_one({"$set": fields}) + cache invalidate, ek jagah se —
+    taaki koi bhi settings-write path cache-invalidate karna na bhoole."""
+    await settings_col.update_one({"_id": "config"}, {"$set": fields}, upsert=True)
+    invalidate_config_cache()
+
+
+async def replace_config(new_doc):
+    new_doc["_id"] = "config"
+    await settings_col.replace_one({"_id": "config"}, new_doc, upsert=True)
+    invalidate_config_cache()
+
+
+async def get_all_admin_ids():
+    """Super-admin (.env) + DB me add kiye gaye admins, dono milake ek set return karta hai. Cached."""
+    global _admin_ids_cache
+    if _admin_ids_cache is None:
+        extra = [doc["_id"] async for doc in admins_col.find({})]
+        _admin_ids_cache = {ADMIN_ID, *extra}
+    return _admin_ids_cache
+
+
+def invalidate_admin_cache():
+    global _admin_ids_cache
+    _admin_ids_cache = None
+
+
+async def is_admin_user(user_id):
+    ids = await get_all_admin_ids()
+    return user_id in ids
+
+
+async def is_banned(user_id):
+    return await banned_col.find_one({"_id": user_id}) is not None
+
+
+async def _admin_filter_func(_, __, update):
+    """Pyrogram custom filter — DB-backed admin list check karta hai (super-admin +
+    add kiye gaye extra admins), taaki static filters.user(ADMIN_ID) ki jagah
+    dynamic multi-admin support kaam kare."""
+    user = update.from_user
+    if not user:
+        return False
+    return await is_admin_user(user.id)
+
+
+admin_filter = filters.create(_admin_filter_func)
+
+
+async def _superadmin_filter_func(_, __, update):
+    """Sirf .env wala ADMIN_ID — extra admins add/remove karna sirf super-admin ka kaam hai."""
+    user = update.from_user
+    return bool(user) and user.id == ADMIN_ID
+
+
+superadmin_filter = filters.create(_superadmin_filter_func)
 
 
 async def get_db_channel_id():
@@ -164,26 +246,39 @@ def parse_ranges(parts):
 # 🛠 ADMIN PANEL
 # ==========================================
 
-async def admin_panel_markup():
+async def admin_panel_markup(user_id=None):
+    """user_id diya jaaye to "Manage Admins" button sirf super-admin ko dikhega —
+    baaki admins ko wo option nahi milega."""
     config = await get_config()
     protect_status = "🟢 ON" if config.get("content_protection") else "🔴 OFF"
-    return InlineKeyboardMarkup([
+    rows = [
+        # --- Setup ---
         [InlineKeyboardButton("📢 Set FSUB", callback_data="panel_setfsub"),
          InlineKeyboardButton("🗄 Set DB Channel", callback_data="panel_setdb")],
         [InlineKeyboardButton("⏱ Set Timer", callback_data="panel_settimer"),
          InlineKeyboardButton("🗑 Auto-Delete", callback_data="panel_autodelete")],
+        # --- Tokens ---
         [InlineKeyboardButton("🔑 Generate Token", callback_data="panel_gentoken"),
          InlineKeyboardButton("❌ Revoke Token", callback_data="panel_revoke")],
         [InlineKeyboardButton("🔍 Search/List Tokens", callback_data="panel_search")],
+        # --- Users ---
+        [InlineKeyboardButton("🚫 Ban / Unban User", callback_data="panel_banmenu")],
+    ]
+    if user_id is None or user_id == ADMIN_ID:
+        rows.append([InlineKeyboardButton("👑 Manage Admins", callback_data="panel_admins")])
+    rows += [
+        # --- Settings ---
         [InlineKeyboardButton(f"🔒 Content Protection: {protect_status}", callback_data="panel_toggleprotect")],
         [InlineKeyboardButton("🤖 Rate-Limit Settings", callback_data="panel_ratelimit")],
         [InlineKeyboardButton("✏️ Edit Messages", callback_data="panel_editmsg")],
         [InlineKeyboardButton("📣 Broadcast", callback_data="panel_broadcast"),
          InlineKeyboardButton("🐞 Debug", callback_data="panel_debug")],
+        # --- Data ---
         [InlineKeyboardButton("📤 Export Settings", callback_data="panel_export"),
          InlineKeyboardButton("📥 Import Settings", callback_data="panel_import")],
         [InlineKeyboardButton("🚪 Quit", callback_data="panel_quit")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def edit_msg_markup():
@@ -193,6 +288,67 @@ def edit_msg_markup():
         rows.append([InlineKeyboardButton(k, callback_data=f"editmsg_{k}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="panel_back")])
     return InlineKeyboardMarkup(rows)
+
+
+# ==========================================
+# 🚫 BAN / UNBAN — menu + list view + JSON export
+# ==========================================
+def ban_menu_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Ban User (by ID)", callback_data="ban_add")],
+        [InlineKeyboardButton("➖ Unban User (by ID)", callback_data="ban_remove")],
+        [InlineKeyboardButton("📋 List Banned Users", callback_data="ban_list_0")],
+        [InlineKeyboardButton("📤 Export Ban List (JSON)", callback_data="ban_export")],
+        [InlineKeyboardButton("🔙 Back", callback_data="panel_back")],
+    ])
+
+
+async def build_ban_list_view(offset=0):
+    cursor = banned_col.find({}).sort("banned_at", -1)
+    all_banned = [b async for b in cursor]
+
+    if not all_banned:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_banmenu")]])
+        return "📋 Koi bhi user banned nahi hai.", markup
+
+    page = all_banned[offset: offset + PAGE_SIZE]
+    lines = ["📋 **Banned Users:**\n"]
+    for b in page:
+        reason = f" — {b['reason']}" if b.get("reason") else ""
+        lines.append(f"`{b['_id']}`{reason}")
+
+    nav_row = []
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"ban_list_{max(0, offset - PAGE_SIZE)}"))
+    if offset + PAGE_SIZE < len(all_banned):
+        nav_row.append(InlineKeyboardButton("Next ⏭", callback_data=f"ban_list_{offset + PAGE_SIZE}"))
+
+    rows = []
+    if nav_row:
+        rows.append(nav_row)
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="panel_banmenu")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+# ==========================================
+# 👑 MANAGE ADMINS — super-admin only
+# ==========================================
+async def build_admin_list_view():
+    extra_admins = [doc["_id"] async for doc in admins_col.find({})]
+    lines = [f"👑 **Admins**\n\n**Super-Admin:** `{ADMIN_ID}` (env)\n"]
+    if extra_admins:
+        lines.append("**Extra Admins:**")
+        for aid in extra_admins:
+            lines.append(f"`{aid}`")
+    else:
+        lines.append("Koi extra admin add nahi kiya hai.")
+
+    rows = [
+        [InlineKeyboardButton("➕ Add Admin (by ID)", callback_data="adm_add")],
+        [InlineKeyboardButton("➖ Remove Admin (by ID)", callback_data="adm_remove")],
+        [InlineKeyboardButton("🔙 Back", callback_data="panel_back")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 # ==========================================
@@ -237,7 +393,10 @@ async def build_revoke_list_view(offset=0):
     page = all_tokens[offset: offset + PAGE_SIZE]
     rows = []
     for t in page:
-        label = f"{t['token_id']} ({len(t['files'])} files)"
+        used = t.get("used_count", 0)
+        limit = t.get("usage_limit")
+        usage_text = f"{used}/{limit} uses" if limit is not None else f"{used} uses"
+        label = f"{t['token_id']} ({len(t['files'])} files, {usage_text})"
         rows.append([InlineKeyboardButton(label, callback_data=f"rvk_{t['token_id']}")])
 
     nav_row = []
@@ -320,7 +479,7 @@ def gtf_summary_text(data):
     )
 
 
-@app.on_message(filters.command("start") & filters.private & filters.user(ADMIN_ID))
+@app.on_message(filters.command("start") & filters.private & admin_filter)
 async def admin_start(client, message):
     """Admin ke liye /start alag hai - customizable admin_welcome message + panel button."""
     await users_col.update_one(
@@ -332,19 +491,22 @@ async def admin_start(client, message):
     await send_custom(client, message.chat.id, "admin_welcome", reply_markup=buttons)
 
 
-@app.on_message(filters.command("admin") & filters.user(ADMIN_ID))
+@app.on_message(filters.command("admin") & admin_filter)
 async def admin_panel(client, message):
-    await message.reply_text("🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup())
+    await message.reply_text(
+        "🛠 **Admin Panel** — neeche se option chuno:",
+        reply_markup=await admin_panel_markup(message.from_user.id)
+    )
 
 
-@app.on_callback_query(filters.regex(r"^panel_") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^panel_") & admin_filter)
 async def panel_callback(client, callback_query):
     action = callback_query.data.split("_", 1)[1]
     user_id = callback_query.from_user.id
 
     if action == "open":
         return await callback_query.message.edit_text(
-            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup(user_id)
         )
 
     if action == "quit":
@@ -354,16 +516,16 @@ async def panel_callback(client, callback_query):
     if action == "back":
         pending_action.pop(user_id, None)
         return await callback_query.message.edit_text(
-            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup(user_id)
         )
 
     if action == "toggleprotect":
         config = await get_config()
         new_value = not config.get("content_protection", False)
-        await settings_col.update_one({"_id": "config"}, {"$set": {"content_protection": new_value}}, upsert=True)
+        await set_config({"content_protection": new_value})
         await callback_query.answer(f"Content Protection {'ON' if new_value else 'OFF'} kar diya.")
         return await callback_query.message.edit_text(
-            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup(user_id)
         )
 
     if action == "ratelimit":
@@ -507,6 +669,20 @@ async def panel_callback(client, callback_query):
         await callback_query.answer()
         return await callback_query.message.edit_text(text, reply_markup=markup)
 
+    if action == "banmenu":
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "🚫 **Ban / Unban User**\n\nNeeche se chuno:",
+            reply_markup=ban_menu_markup()
+        )
+
+    if action == "admins":
+        if user_id != ADMIN_ID:
+            return await callback_query.answer("❌ Ye sirf super-admin ke liye hai.", show_alert=True)
+        text, markup = await build_admin_list_view()
+        await callback_query.answer()
+        return await callback_query.message.edit_text(text, reply_markup=markup)
+
     back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
 
     prompts = {
@@ -518,7 +694,7 @@ async def panel_callback(client, callback_query):
     await callback_query.message.edit_text(prompts[action], reply_markup=back_btn)
 
 
-@app.on_callback_query(filters.regex(r"^stmr_") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^stmr_") & admin_filter)
 async def settimer_callback(client, callback_query):
     value = callback_query.data.split("_", 1)[1]
     user_id = callback_query.from_user.id
@@ -531,14 +707,14 @@ async def settimer_callback(client, callback_query):
             "⏱ Default token expiry time bhej (e.g. `1h`, `30m`, `1d`):", reply_markup=back_btn
         )
 
-    await settings_col.update_one({"_id": "config"}, {"$set": {"default_timer": value}}, upsert=True)
+    await set_config({"default_timer": value})
     await callback_query.answer(f"✅ Default timer set: {value}")
     await callback_query.message.edit_text(
-        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup(user_id)
     )
 
 
-@app.on_callback_query(filters.regex(r"^adel_") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^adel_") & admin_filter)
 async def autodelete_callback(client, callback_query):
     value = callback_query.data.split("_", 1)[1]
     user_id = callback_query.from_user.id
@@ -552,19 +728,19 @@ async def autodelete_callback(client, callback_query):
         )
 
     if value == "off":
-        await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": 0}}, upsert=True)
+        await set_config({"auto_delete_seconds": 0})
         await callback_query.answer("✅ Auto-delete band kar diya.")
     else:
         seconds = parse_time(value)
-        await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": seconds}}, upsert=True)
+        await set_config({"auto_delete_seconds": seconds})
         await callback_query.answer(f"✅ Auto-delete set: {value}")
 
     await callback_query.message.edit_text(
-        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup(user_id)
     )
 
 
-@app.on_callback_query(filters.regex(r"^rvkpage_") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^rvkpage_") & admin_filter)
 async def revoke_page_callback(client, callback_query):
     offset = int(callback_query.data.split("_", 1)[1])
     text, markup = await build_revoke_list_view(offset=offset)
@@ -572,31 +748,116 @@ async def revoke_page_callback(client, callback_query):
     await callback_query.message.edit_text(text, reply_markup=markup)
 
 
-@app.on_callback_query(filters.regex(r"^rvk_") & filters.user(ADMIN_ID))
+# ==========================================
+# 🚫 BAN / UNBAN — callbacks
+# ==========================================
+@app.on_callback_query(filters.regex(r"^ban_") & admin_filter)
+async def ban_callback(client, callback_query):
+    action = callback_query.data.split("_", 1)[1]
+    user_id = callback_query.from_user.id
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_banmenu")]])
+
+    if action == "add":
+        pending_action[user_id] = "awaiting_ban_add"
+        await callback_query.answer()
+        return await callback_query.message.edit_text(
+            "🚫 Ban karne ke liye **user ID** bhej. Reason bhi de sakta hai (optional):\n\n`123456789 spam kar raha`",
+            reply_markup=back_btn
+        )
+
+    if action == "remove":
+        pending_action[user_id] = "awaiting_ban_remove"
+        await callback_query.answer()
+        return await callback_query.message.edit_text("➖ Unban karne ke liye **user ID** bhej:", reply_markup=back_btn)
+
+    if action == "export":
+        all_banned = [b async for b in banned_col.find({})]
+        if not all_banned:
+            await callback_query.answer("Banned list khaali hai.", show_alert=True)
+            return
+        export_data = [
+            {"user_id": b["_id"], "banned_at": str(b.get("banned_at", "")), "reason": b.get("reason")}
+            for b in all_banned
+        ]
+        json_str = json.dumps(export_data, indent=2, ensure_ascii=False)
+        await callback_query.answer()
+        # JSON file bhejte hain, bada list ho to text-message me fit nahi hoga.
+        file_bytes = io.BytesIO(json_str.encode("utf-8"))
+        file_bytes.name = "banned_users.json"
+        await client.send_document(callback_query.message.chat.id, file_bytes, caption=f"📤 {len(all_banned)} banned users.")
+        return
+
+    if action.startswith("list_"):
+        offset = int(action.split("_", 1)[1])
+        text, markup = await build_ban_list_view(offset=offset)
+        await callback_query.answer()
+        return await callback_query.message.edit_text(text, reply_markup=markup)
+
+
+# ==========================================
+# 👑 MANAGE ADMINS — callbacks (super-admin only)
+# ==========================================
+@app.on_callback_query(filters.regex(r"^adm_") & admin_filter)
+async def admin_manage_callback(client, callback_query):
+    action = callback_query.data.split("_", 1)[1]
+    user_id = callback_query.from_user.id
+    if user_id != ADMIN_ID:
+        return await callback_query.answer("❌ Ye sirf super-admin ke liye hai.", show_alert=True)
+
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_admins")]])
+
+    if action == "add":
+        pending_action[user_id] = "awaiting_adm_add"
+        await callback_query.answer()
+        return await callback_query.message.edit_text("➕ Naye admin ki **user ID** bhej:", reply_markup=back_btn)
+
+    if action == "remove":
+        pending_action[user_id] = "awaiting_adm_remove"
+        await callback_query.answer()
+        return await callback_query.message.edit_text("➖ Hatane wale admin ki **user ID** bhej:", reply_markup=back_btn)
+
+
+@app.on_callback_query(filters.regex(r"^rvk_") & admin_filter)
 async def revoke_select_callback(client, callback_query):
     token_id = callback_query.data.split("_", 1)[1]
+    token_data = await tokens_col.find_one({"token_id": token_id})
     buttons = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Confirm Revoke", callback_data=f"rvkc_{token_id}")],
         [InlineKeyboardButton("🔙 Cancel", callback_data="panel_revoke")],
     ])
     await callback_query.answer()
-    await callback_query.message.edit_text(f"⚠️ Sure? `{token_id}` revoke karna hai?", reply_markup=buttons)
+    if not token_data:
+        return await callback_query.message.edit_text(
+            f"⚠️ Sure? `{token_id}` revoke karna hai?", reply_markup=buttons
+        )
+    used = token_data.get("used_count", 0)
+    limit = token_data.get("usage_limit")
+    usage_text = f"{used}/{limit}" if limit is not None else f"{used} (unlimited limit)"
+    text = (
+        f"⚠️ **Revoke Token?**\n\n"
+        f"**Token:** `{token_id}`\n"
+        f"**Files:** {len(token_data.get('files', []))}\n"
+        f"**Used:** {usage_text}\n\n"
+        f"Sure?"
+    )
+    await callback_query.message.edit_text(text, reply_markup=buttons)
 
 
-@app.on_callback_query(filters.regex(r"^rvkc_") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^rvkc_") & admin_filter)
 async def revoke_confirm_callback(client, callback_query):
     token_id = callback_query.data.split("_", 1)[1]
+    user_id = callback_query.from_user.id
     result = await tokens_col.update_one({"token_id": token_id}, {"$set": {"revoked": True}})
     if result.matched_count == 0:
         await callback_query.answer("❌ Token mila hi nahi.", show_alert=True)
     else:
         await callback_query.answer("✅ Token revoke ho gaya.")
     await callback_query.message.edit_text(
-        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+        "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup(user_id)
     )
 
 
-@app.on_callback_query(filters.regex(r"^gtf_") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^gtf_") & admin_filter)
 async def gentoken_wizard_callback(client, callback_query):
     action_key = callback_query.data.split("_", 1)[1]
     user_id = callback_query.from_user.id
@@ -606,7 +867,7 @@ async def gentoken_wizard_callback(client, callback_query):
         pending_action.pop(user_id, None)
         await callback_query.answer("❌ Cancel kar diya.")
         return await callback_query.message.edit_text(
-            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup(user_id)
         )
 
     if not isinstance(state, dict) or state.get("flow") != "gentoken":
@@ -707,7 +968,7 @@ async def gentoken_wizard_callback(client, callback_query):
         return await callback_query.message.edit_text(reply_text)
 
 
-@app.on_callback_query(filters.regex(r"^editmsg_") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^editmsg_") & admin_filter)
 async def editmsg_callback(client, callback_query):
     key = callback_query.data.split("_", 1)[1]
     user_id = callback_query.from_user.id
@@ -725,7 +986,7 @@ async def editmsg_callback(client, callback_query):
     )
 
 
-@app.on_callback_query(filters.regex(r"^rl_") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^rl_") & admin_filter)
 async def ratelimit_callback(client, callback_query):
     field = callback_query.data.split("_", 1)[1]  # setcount / setwindow / setwait / setmessage
     user_id = callback_query.from_user.id
@@ -742,7 +1003,7 @@ async def ratelimit_callback(client, callback_query):
     await callback_query.message.edit_text(prompts[field], reply_markup=back_btn)
 
 
-@app.on_callback_query(filters.regex(r"^bcast_") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^bcast_") & admin_filter)
 async def bcast_callback(client, callback_query):
     kind = callback_query.data.split("_", 1)[1]  # "users" ya "channels"
     user_id = callback_query.from_user.id
@@ -774,7 +1035,7 @@ async def bcast_callback(client, callback_query):
         )
 
 
-@app.on_message(filters.command("addchannel") & filters.user(ADMIN_ID))
+@app.on_message(filters.command("addchannel") & admin_filter)
 async def add_broadcast_channel(client, message):
     if len(message.command) < 2:
         return await message.reply_text("Format: `/addchannel <channel_id>`")
@@ -788,11 +1049,11 @@ async def add_broadcast_channel(client, message):
     if channel_id in channels:
         return await message.reply_text("⚠️ Ye channel already list me hai.")
     channels.append(channel_id)
-    await settings_col.update_one({"_id": "config"}, {"$set": {"broadcast_channels": channels}}, upsert=True)
+    await set_config({"broadcast_channels": channels})
     await message.reply_text(f"✅ Channel add ho gaya. Total: {len(channels)}\n\n⚠️ Bot ko us channel me admin banana mat bhoolna.")
 
 
-@app.on_message(filters.command("search") & filters.user(ADMIN_ID))
+@app.on_message(filters.command("search") & admin_filter)
 async def search_tokens_command(client, message):
     now = datetime.now()
     cursor = tokens_col.find({"revoked": False, "expiry_time": {"$gt": now}}).sort("expiry_time", 1)
@@ -873,7 +1134,7 @@ async def handle_gentoken_wizard_text(client, message, user_id, action):
         )
 
 
-@app.on_message(filters.private & filters.text & filters.user(ADMIN_ID) & ~filters.command([
+@app.on_message(filters.private & filters.text & admin_filter & ~filters.command([
     "start", "admin", "addchannel", "search"
 ]))
 async def handle_admin_pending(client, message):
@@ -892,57 +1153,57 @@ async def handle_admin_pending(client, message):
             int(text)
         except ValueError:
             return await message.reply_text("❌ Ye ID nahi lag rahi. Number bhej (e.g. `-1001234567890`) — dobara try kar.")
-        await settings_col.update_one({"_id": "config"}, {"$set": {"fsub_id": text}}, upsert=True)
+        await set_config({"fsub_id": text})
         pending_action[user_id] = "awaiting_setfsublink"
         return await message.reply_text("✅ ID save ho gayi. Ab channel ka **invite/join link** bhej (e.g. `https://t.me/teraChannel`):")
 
     elif action == "awaiting_setfsublink":
         if not (text.startswith("https://t.me/") or text.startswith("t.me/")):
             return await message.reply_text("❌ Ye valid link nahi lag raha. `https://t.me/...` format me bhej.")
-        await settings_col.update_one({"_id": "config"}, {"$set": {"fsub_link": text}}, upsert=True)
+        await set_config({"fsub_link": text})
         await message.reply_text(f"✅ FSUB poora set ho gaya!\n**ID:** saved\n**Link:** {text}\n\n⚠️ Bot ko us channel me admin banana mat bhoolna, warna join-check kaam nahi karega.")
 
     elif action == "awaiting_setdb":
-        await settings_col.update_one({"_id": "config"}, {"$set": {"db_channel_id": text}}, upsert=True)
+        await set_config({"db_channel_id": text})
         await message.reply_text(f"✅ DB channel set ho gaya: `{text}`")
 
     elif action == "awaiting_settimer":
         if parse_time(text) is None:
             return await message.reply_text("❌ Format galat hai. Use: 10s, 5m, 1h, 1d — dobara bhej.")
-        await settings_col.update_one({"_id": "config"}, {"$set": {"default_timer": text}}, upsert=True)
+        await set_config({"default_timer": text})
         await message.reply_text(f"✅ Default timer set ho gaya: `{text}`")
 
     elif action == "awaiting_autodelete":
         if text.lower() == "off":
-            await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": 0}}, upsert=True)
+            await set_config({"auto_delete_seconds": 0})
             await message.reply_text("✅ Auto-delete band kar diya.")
         else:
             seconds = parse_time(text)
             if seconds is None:
                 return await message.reply_text("❌ Format galat hai. Use: 10m, 1h, ya `off` — dobara bhej.")
-            await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": seconds}}, upsert=True)
+            await set_config({"auto_delete_seconds": seconds})
             await message.reply_text(f"✅ Files ab {text} baad auto-delete hongi.")
 
     elif action == "awaiting_rl_setcount":
         if not text.isdigit() or int(text) < 1:
             return await message.reply_text("❌ Ye ek valid positive number nahi hai — dobara bhej.")
-        await settings_col.update_one({"_id": "config"}, {"$set": {"ratelimit_count": int(text)}}, upsert=True)
+        await set_config({"ratelimit_count": int(text)})
         await message.reply_text(f"✅ Rate-limit count set ho gaya: {text} baar")
 
     elif action == "awaiting_rl_setwindow":
         if not text.isdigit() or int(text) < 1:
             return await message.reply_text("❌ Ye ek valid positive number nahi hai (seconds me) — dobara bhej.")
-        await settings_col.update_one({"_id": "config"}, {"$set": {"ratelimit_window": int(text)}}, upsert=True)
+        await set_config({"ratelimit_window": int(text)})
         await message.reply_text(f"✅ Rate-limit window set ho gaya: {text}s")
 
     elif action == "awaiting_rl_setwait":
         if not text.isdigit() or int(text) < 1:
             return await message.reply_text("❌ Ye ek valid positive number nahi hai (seconds me) — dobara bhej.")
-        await settings_col.update_one({"_id": "config"}, {"$set": {"ratelimit_wait": int(text)}}, upsert=True)
+        await set_config({"ratelimit_wait": int(text)})
         await message.reply_text(f"✅ Rate-limit cooldown set ho gaya: {text}s")
 
     elif action == "awaiting_rl_setmessage":
-        await settings_col.update_one({"_id": "config"}, {"$set": {"ratelimit_message": text}}, upsert=True)
+        await set_config({"ratelimit_message": text})
         await message.reply_text(f"✅ Rate-limit message set ho gaya:\n`{text}`")
 
     elif action.startswith("awaiting_editmsg_"):
@@ -953,7 +1214,7 @@ async def handle_admin_pending(client, message):
         config = await get_config()
         messages = config.get("messages", {})
         messages[key] = {"text": main_text, "extra": extras}
-        await settings_col.update_one({"_id": "config"}, {"$set": {"messages": messages}}, upsert=True)
+        await set_config({"messages": messages})
         await message.reply_text(f"✅ `{key}` update ho gaya.\nMain: {main_text}\nExtras: {len(extras)}")
 
     elif action == "awaiting_import":
@@ -966,8 +1227,7 @@ async def handle_admin_pending(client, message):
             imported = json.loads(cleaned)
             if not isinstance(imported, dict):
                 raise ValueError("JSON ek object hona chahiye")
-            imported["_id"] = "config"
-            await settings_col.replace_one({"_id": "config"}, imported, upsert=True)
+            await replace_config(imported)
             await message.reply_text("✅ Settings import ho gayi! `/admin` se check kar le.")
         except Exception as e:
             return await message.reply_text(f"❌ JSON parse nahi hua: {e}\nDobara sahi JSON bhej.")
@@ -1023,12 +1283,75 @@ async def handle_admin_pending(client, message):
         channels = config.get("broadcast_channels", [])
         if text not in channels:
             channels.append(text)
-            await settings_col.update_one({"_id": "config"}, {"$set": {"broadcast_channels": channels}}, upsert=True)
+            await set_config({"broadcast_channels": channels})
         await message.reply_text(f"✅ Channel add ho gaya. Ab broadcast me message bhej.\n\n⚠️ Bot ko us channel me admin banana mat bhoolna.")
         pending_action[user_id] = "awaiting_bcast_channels"
         return
 
-    pending_action.pop(user_id, None) if action not in ("awaiting_setfsub",) else None
+    elif action == "awaiting_ban_add":
+        parts = text.split(maxsplit=1)
+        try:
+            target_id = int(parts[0])
+        except (ValueError, IndexError):
+            return await message.reply_text("❌ Valid user ID bhej (number). Optional reason space ke baad: `123456 spam kar raha`")
+        reason = parts[1] if len(parts) > 1 else None
+        await banned_col.update_one(
+            {"_id": target_id},
+            {"$set": {"banned_at": datetime.now(), "reason": reason}},
+            upsert=True
+        )
+        # FSUB channel se turant kick — agar member hai to, warna silently ignore.
+        config = await get_config()
+        fsub_id = config.get("fsub_id")
+        kicked_note = ""
+        if fsub_id:
+            try:
+                await client.ban_chat_member(int(fsub_id), target_id)
+                kicked_note = " Aur FSUB channel se bhi kick kar diya."
+            except Exception:
+                kicked_note = " (FSUB se kick nahi ho paya — shayad member nahi tha ya bot ke paas permission nahi hai.)"
+        await message.reply_text(f"🚫 User `{target_id}` ban ho gaya.{kicked_note}")
+
+    elif action == "awaiting_ban_remove":
+        try:
+            target_id = int(text)
+        except ValueError:
+            return await message.reply_text("❌ Valid user ID bhej (number) — dobara try kar.")
+        result = await banned_col.delete_one({"_id": target_id})
+        if result.deleted_count == 0:
+            await message.reply_text(f"❌ `{target_id}` banned list me mila hi nahi.")
+        else:
+            await message.reply_text(f"✅ User `{target_id}` unban ho gaya.")
+
+    elif action == "awaiting_adm_add":
+        if user_id != ADMIN_ID:
+            return  # Extra safety — button khud super-admin ko hi dikhta hai, par text-input bypass na ho sake isliye yahan bhi check.
+        try:
+            target_id = int(text)
+        except ValueError:
+            return await message.reply_text("❌ Valid user ID bhej (number) — dobara try kar.")
+        await admins_col.update_one({"_id": target_id}, {"$set": {"_id": target_id}}, upsert=True)
+        invalidate_admin_cache()
+        await message.reply_text(f"👑 User `{target_id}` ab admin hai.")
+
+    elif action == "awaiting_adm_remove":
+        if user_id != ADMIN_ID:
+            return
+        try:
+            target_id = int(text)
+        except ValueError:
+            return await message.reply_text("❌ Valid user ID bhej (number) — dobara try kar.")
+        if target_id == ADMIN_ID:
+            return await message.reply_text("❌ Super-admin ko remove nahi kar sakta.")
+        result = await admins_col.delete_one({"_id": target_id})
+        invalidate_admin_cache()
+        if result.deleted_count == 0:
+            await message.reply_text(f"❌ `{target_id}` admin list me mila hi nahi.")
+        else:
+            await message.reply_text(f"✅ `{target_id}` ab admin nahi raha.")
+
+    if action != "awaiting_setfsub":
+        pending_action.pop(user_id, None)
 
 
 # ==========================================
@@ -1122,39 +1445,60 @@ async def next_batch_callback(client, callback_query):
 # ==========================================
 
 async def check_rate_limit(user_id):
-    """Sliding-window rate limit: last WINDOW seconds me COUNT ya usse zyada
-    redeem kiye to True (blocked) + fixed wait_seconds cooldown return karta hai."""
+    """Sliding-window detection + fixed hard-cooldown enforcement.
+
+    Purana bug: (1) wait_seconds hamesha fixed DEFAULT_RATELIMIT_WAIT tha, actual
+    remaining cooldown nahi — ab blocked_until - now se exact countdown milta hai.
+    (2) record_redemption sirf successful attempt pe chalta tha, blocked attempt pe
+    nahi — isse spam karne pe history clear ho jaati thi aur cooldown lagne ke
+    turant baad hi dobara burst allowed ho jaata tha. Ab har attempt (block ho ya
+    na ho) record hoti hai, taaki cooldown ke dauraan spam se limit reset na ho.
+
+    Returns (is_blocked: bool, wait_seconds: int) — jab blocked hai to wait_seconds
+    hamesha exact remaining time hai, kabhi bhi fixed config value nahi.
+    """
+    now = datetime.now().timestamp()
+
+    # Pehle se hard-blocked hai? Naya window-check ya record karne ki zaroorat nahi —
+    # cooldown ke dauran attempts count karna faltu hai, blocked_until hi authority hai.
+    blocked_until = rate_limit_blocks.get(user_id)
+    if blocked_until and now < blocked_until:
+        return True, int(blocked_until - now) + 1
+
     config = await get_config()
     count_limit = config.get("ratelimit_count", DEFAULT_RATELIMIT_COUNT)
     window = config.get("ratelimit_window", DEFAULT_RATELIMIT_WINDOW)
     wait_seconds = config.get("ratelimit_wait", DEFAULT_RATELIMIT_WAIT)
 
-    now = datetime.now().timestamp()
     history = redemption_times.get(user_id, [])
-    # Window ke bahar wale purane timestamps hata do
-    history = [t for t in history if now - t < window]
+    history = [t for t in history if now - t < window]  # window ke bahar wale purane timestamps hata do
+    history.append(now)  # is attempt ko bhi record karo — chahe ye block ho ya na ho
     redemption_times[user_id] = history
 
     if len(history) >= count_limit:
+        # Limit cross hui — ab fixed hard-cooldown lagao. Jab tak ye khatam na ho,
+        # sliding window dobara check nahi hogi (upar wala early-return isko handle karta hai).
+        rate_limit_blocks[user_id] = now + wait_seconds
         return True, wait_seconds
+
     return False, wait_seconds
-
-
-def record_redemption(user_id):
-    now = datetime.now().timestamp()
-    redemption_times.setdefault(user_id, []).append(now)
 
 
 async def redeem_token(client, message, token):
     """Token check + file delivery — plain-text token aur deep-link (/start token) dono se call hota hai."""
     user_id = message.from_user.id
 
+    if await is_banned(user_id):
+        return  # Banned user ko silently ignore karo — koi feedback nahi ki bot exist karta hai.
+
     is_limited, wait_seconds = await check_rate_limit(user_id)
     if is_limited:
         config = await get_config()
-        template = config.get("ratelimit_message", DEFAULT_RATELIMIT_MESSAGE)
-        text = template.replace("{s}", str(wait_seconds))
-        return await message.reply_text(f"🤖\n{text}")
+        emoji_msg = await get_message("ratelimit")  # editable "🤖" — admin panel se change ho sakta hai
+        wait_template = config.get("ratelimit_message", DEFAULT_RATELIMIT_MESSAGE)
+        wait_text = wait_template.replace("{s}", str(wait_seconds))
+        await message.reply_text(emoji_msg["text"])
+        return await message.reply_text(wait_text)
 
     if not await is_fsub_joined(client, user_id):
         config = await get_config()
@@ -1177,15 +1521,17 @@ async def redeem_token(client, message, token):
     if usage_limit is not None and used_count >= usage_limit:
         return await message.reply_text("❌")
 
-    record_redemption(user_id)
     await tokens_col.update_one({"token_id": token}, {"$inc": {"used_count": 1}})
 
     await send_custom(client, message.chat.id, "sending")
     await send_batch(client, message.chat.id, token_data, offset=0)
 
 
-@app.on_message(filters.command("start") & filters.private & ~filters.user(ADMIN_ID))
+@app.on_message(filters.command("start") & filters.private & ~admin_filter)
 async def user_start(client, message):
+    if await is_banned(message.from_user.id):
+        return await send_custom(client, message.chat.id, "banned")
+
     await users_col.update_one(
         {"_id": message.from_user.id},
         {"$set": {"_id": message.from_user.id, "first_seen": datetime.now()}},
@@ -1214,6 +1560,8 @@ async def user_start(client, message):
 @app.on_callback_query(filters.regex(r"^verify_fsub$"))
 async def verify_fsub_callback(client, callback_query):
     user_id = callback_query.from_user.id
+    if await is_banned(user_id):
+        return await callback_query.answer("🚫 Tu banned hai.", show_alert=True)
     if await is_fsub_joined(client, user_id):
         await callback_query.answer("✅ Verified!")
         msg_data = await get_message("verified")
@@ -1224,7 +1572,7 @@ async def verify_fsub_callback(client, callback_query):
         await callback_query.answer("❌ Abhi bhi join nahi kiya hai. Pehle join kar.", show_alert=True)
 
 
-@app.on_message(filters.private & filters.text & filters.regex(r"^Kissu-") & ~filters.user(ADMIN_ID))
+@app.on_message(filters.private & filters.text & filters.regex(r"^Kissu-") & ~admin_filter)
 async def handle_token_input(client, message):
     token = message.text.strip()
     await redeem_token(client, message, token)
